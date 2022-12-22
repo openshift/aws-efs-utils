@@ -1,4 +1,4 @@
-FROM registry.ci.openshift.org/ocp/4.13:base
+FROM registry.ci.openshift.org/ocp/builder:rhel-9-base-openshift-4.13
 
 # install deps
 RUN yum update -y && \
