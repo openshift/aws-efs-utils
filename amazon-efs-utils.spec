@@ -18,20 +18,24 @@
 %global with_systemd 1
 %endif
 
-%if 0%{?is_opensuse}
-%global platform .opensuse
+%if 0%{?dist:1}
+%global platform %{dist}
 %else
-
-%if 0%{?sle_version}
+%if 0%{?suse_version}
 %global platform .suse
 %else
-%global platform %{dist}
+%global platform .unknown
+%endif
 %endif
 
+%if 0%{?amzn} > 2
+%global efs_bindir %{_sbindir}
+%else
+%global efs_bindir /sbin
 %endif
 
 Name      : amazon-efs-utils
-Version   : 1.31.3
+Version   : 1.34.5
 Release   : 1%{platform}
 Summary   : This package provides utilities for simplifying the use of EFS file systems
 
@@ -39,13 +43,15 @@ Group     : Amazon/Tools
 License   : MIT
 URL       : https://aws.amazon.com/efs
 
-Packager  : Amazon.com, Inc. <http://aws.amazon.com>
-Vendor    : Amazon.com
 
 BuildArch : noarch
 
 Requires  : nfs-utils
+%if 0%{?amzn2}
+Requires  : stunnel5
+%else
 Requires  : stunnel >= 4.56
+%endif
 Requires  : %{python_requires}
 Requires  : openssl >= 1.0.2
 Requires  : util-linux
@@ -78,14 +84,14 @@ mkdir -p %{buildroot}%{_sysconfdir}/init
 install -p -m 644 %{_builddir}/%{name}/dist/amazon-efs-mount-watchdog.conf %{buildroot}%{_sysconfdir}/init
 %endif
 
-mkdir -p %{buildroot}/sbin
+mkdir -p %{buildroot}%{efs_bindir}
 mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_localstatedir}/log/amazon/efs
 mkdir -p  %{buildroot}%{_mandir}/man8
 
 install -p -m 644 %{_builddir}/%{name}/dist/efs-utils.conf %{buildroot}%{_sysconfdir}/amazon/efs
 install -p -m 444 %{_builddir}/%{name}/dist/efs-utils.crt %{buildroot}%{_sysconfdir}/amazon/efs
-install -p -m 755 %{_builddir}/%{name}/src/mount_efs/__init__.py %{buildroot}/sbin/mount.efs
+install -p -m 755 %{_builddir}/%{name}/src/mount_efs/__init__.py %{buildroot}%{efs_bindir}/mount.efs
 install -p -m 755 %{_builddir}/%{name}/src/watchdog/__init__.py %{buildroot}%{_bindir}/amazon-efs-mount-watchdog
 install -p -m 644 %{_builddir}/%{name}/man/mount.efs.8 %{buildroot}%{_mandir}/man8
 
@@ -97,7 +103,7 @@ install -p -m 644 %{_builddir}/%{name}/man/mount.efs.8 %{buildroot}%{_mandir}/ma
 %config(noreplace) %{_sysconfdir}/init/amazon-efs-mount-watchdog.conf
 %endif
 %{_sysconfdir}/amazon/efs/efs-utils.crt
-/sbin/mount.efs
+%{efs_bindir}/mount.efs
 %{_bindir}/amazon-efs-mount-watchdog
 /var/log/amazon
 %{_mandir}/man8/mount.efs.8.gz
@@ -131,7 +137,49 @@ fi
 %clean
 
 %changelog
-* Thu Nov 23 2021 Jigar Dedhia <dedhiajd@amazon.com> - 1.31.3
+* Wed Jan 1 2023 Ryan Stankiewicz <rjstank@amazon.com> - 1.34.5
+- Watchdog detect empty private key and regenerate
+- Update man page
+- Avoid redundant get_target_region call
+- Handle invalid mount point name
+
+* Tue Dec 13 2022 Ryan Stankiewicz <rjstank@amazon.com> - 1.34.4
+- Fix potential tlsport selection collision by using state file as tlsport lock file.
+
+* Thu Dec 1 2022 Preetham Puneeth Munipalli <tmunipre@amazon.com> - 1.34.3
+- Fix potential tlsport selection race condition by closing socket right before establishing stunnel
+- Fix stunnel constantly restart issue when upgrading from 1.32.1 and before version to latest version
+- Speed up the way to check network availability by using systemctl is-active
+
+* Tue Nov 22 2022 Preetham Puneeth Munipalli <tmunipre@amazon.com> - 1.34.2
+- Fix potential issue on AL2 when watchdog trying to restart stunnel for the TLS mounts that existing before upgrade
+
+* Thu Sep 29 2022 Preetham Puneeth Munipalli <tmunipre@amazon.com> - 1.34.1
+- Update Amazon Linux 2 platform to use namespaced stunnel5
+
+* Thu Sep 1 2022 Yuan Gao <ygaochn@amazon.com> - 1.33.4
+- Fix potential issue where watchdog sending signal to incorrect processes.
+- Add support for enabling FIPS mode for both stunnel and AWS API calls.
+
+* Wed Jul 13 2022 Yuan Gao <ygaochn@amazon.com> - 1.33.3
+- Fix potential stunnel hanging issue caused by full subprocess PIPE filled by stunnel log.
+
+* Mon Jun 6 2022 Yuan Gao <ygaochn@amazon.com> - 1.33.2
+- Fix the incorrect path to generate read_ahead_kb config file.
+- Bump the default tls port range from 400 to 1000.
+
+* Fri May 6 2022 Yuan Gao <ygaochn@amazon.com> - 1.33.1
+- Enable mount process to retry on failed or timed out mount.nfs command.
+
+* Thu Apr 28 2022 Yuan Gao <ygaochn@amazon.com> - 1.32.2
+- Fix potential race condition issue when stunnel creating pid file.
+
+* Thu Mar 31 2022 Shivam Gupta <lshigupt@amazon.com> - 1.32.1
+- Enable watchdog to check stunnel health periodically and restart hanging stunnel process when necessary.
+- Fix potential race condition issue when removing lock files.
+- Add efs-utils Support for MacOS Monterey EC2 instances.
+
+* Tue Nov 23 2021 Jigar Dedhia <dedhiajd@amazon.com> - 1.31.3
 - Add unmount_time and unmount_count to handle inconsistent mount reads
 - Allow specifying fs_id in cloudwatch log group name
 

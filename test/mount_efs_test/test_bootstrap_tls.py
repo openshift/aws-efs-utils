@@ -6,9 +6,9 @@
 
 import os
 import tempfile
+from unittest.mock import MagicMock
 
 import mount_efs
-from mock import MagicMock
 
 AP_ID = "fsap-beefdead"
 FS_ID = "fs-deadbeef"
@@ -16,6 +16,7 @@ CLIENT_SOURCE = "test"
 DNS_NAME = "%s.efs.us-east-1.amazonaws.com" % FS_ID
 MOUNT_POINT = "/mnt"
 REGION = "us-east-1"
+
 
 DEFAULT_TLS_PORT = 20049
 
@@ -43,6 +44,10 @@ def setup_mocks(mocker):
     mocker.patch("mount_efs.create_certificate")
     mocker.patch("os.rename")
     mocker.patch("os.kill")
+    mocker.patch(
+        "mount_efs.update_tls_tunnel_temp_state_file_with_tunnel_pid",
+        return_value="~mocktempfile",
+    )
 
     process_mock = MagicMock()
     process_mock.communicate.return_value = (
@@ -71,6 +76,10 @@ def setup_mocks_without_popen(mocker):
     )
     mocker.patch("mount_efs.write_tls_tunnel_state_file", return_value="~mocktempfile")
     mocker.patch("os.kill")
+    mocker.patch(
+        "mount_efs.update_tls_tunnel_temp_state_file_with_tunnel_pid",
+        return_value="~mocktempfile",
+    )
 
     write_config_mock = mocker.patch(
         "mount_efs.write_stunnel_config_file", return_value=EXPECTED_STUNNEL_CONFIG_FILE
@@ -97,7 +106,7 @@ def test_bootstrap_tls_state_file_dir_exists(mocker, tmpdir):
 
 def test_bootstrap_tls_state_file_nonexistent_dir(mocker, tmpdir):
     popen_mock, _ = setup_mocks(mocker)
-    state_file_dir = str(tmpdir.join(tempfile.mktemp()))
+    state_file_dir = str(tmpdir.join(tempfile.mkdtemp()[1]))
 
     def config_get_side_effect(section, field):
         if section == mount_efs.CONFIG_SECTION and field == "state_file_dir_mode":
@@ -114,6 +123,7 @@ def test_bootstrap_tls_state_file_nonexistent_dir(mocker, tmpdir):
     assert not os.path.exists(state_file_dir)
 
     mocker.patch("mount_efs._stunnel_bin", return_value="/usr/bin/stunnel")
+    mocker.patch("mount_efs.find_existing_mount_using_tls_port", return_value=None)
     with mount_efs.bootstrap_tls(
         MOCK_CONFIG, INIT_SYSTEM, DNS_NAME, FS_ID, MOUNT_POINT, {}, state_file_dir
     ):
@@ -171,6 +181,11 @@ def test_bootstrap_tls_non_default_port(mocker, tmpdir):
     state_file_dir = str(tmpdir)
 
     tls_port = 1000
+    tls_port_sock_mock = MagicMock()
+    tls_port_sock_mock.getsockname.return_value = ("local_host", tls_port)
+    tls_port_sock_mock.close.side_effect = None
+    mocker.patch("socket.socket", return_value=tls_port_sock_mock)
+
     mocker.patch("mount_efs._stunnel_bin", return_value="/usr/bin/stunnel")
     with mount_efs.bootstrap_tls(
         MOCK_CONFIG,
@@ -189,7 +204,11 @@ def test_bootstrap_tls_non_default_port(mocker, tmpdir):
 
     assert "/usr/bin/stunnel" in popen_args
     assert EXPECTED_STUNNEL_CONFIG_FILE in popen_args
-    assert 1000 == write_config_args[4]  # positional argument for tls_port
+    assert tls_port == write_config_args[4]  # positional argument for tls_port
+    # Ensure tls port socket is closed in bootstrap_tls
+    # The number is two here, the first one is the actual socket when choosing tls port, the second one is a socket to
+    # verify tls port can be connected after establishing TLS stunnel. They share the same mock.
+    assert 2 == tls_port_sock_mock.close.call_count
 
 
 def test_bootstrap_tls_non_default_verify_level(mocker, tmpdir):

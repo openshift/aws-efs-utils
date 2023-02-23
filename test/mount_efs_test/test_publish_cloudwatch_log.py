@@ -4,9 +4,11 @@
 # for the specific language governing permissions and limitations under
 # the License.
 
-import mount_efs
+from unittest.mock import MagicMock
+
 from botocore.exceptions import ClientError, NoCredentialsError
-from mock import MagicMock
+
+import mount_efs
 
 from .. import utils
 
@@ -335,6 +337,7 @@ def _test_botocore_client_established(mocker, iam_name):
     mount_efs.BOTOCORE_PRESENT = True
     mocker.patch("mount_efs.get_target_region", return_value="us-east-1")
     mocker.patch("mount_efs.get_iam_role_name", return_value=iam_name)
+    mocker.patch("mount_efs.get_fips_config", return_value=False)
     mocker.patch(
         "mount_efs.get_aws_security_credentials_from_instance_metadata",
         return_value=(
