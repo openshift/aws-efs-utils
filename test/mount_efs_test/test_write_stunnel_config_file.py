@@ -6,8 +6,9 @@
 
 import os
 
-import mount_efs
 import pytest
+
+import mount_efs
 
 from .. import utils
 
@@ -33,17 +34,33 @@ def _get_config(
     stunnel_debug_enabled=False,
     stunnel_check_cert_hostname_supported=True,
     stunnel_check_cert_validity_supported=True,
+    stunnel_foreground_quiet_supported=False,
     stunnel_check_cert_hostname=None,
     stunnel_check_cert_validity=False,
     stunnel_logs_file=None,
+    stunnel_libwrap_option_supported=True,
+    fips_mode_enabled=False,
 ):
 
+    options = []
+    if stunnel_check_cert_hostname_supported:
+        options.append(b"checkHost              = peer certificate host name pattern")
+    if stunnel_check_cert_validity_supported:
+        options.append(
+            b"OCSPaia                = yes|no check the AIA responders from certificates"
+        )
+    if stunnel_libwrap_option_supported:
+        options.append(
+            b"libwrap                = yes|no use /etc/hosts.allow and /etc/hosts.deny"
+        )
+    if stunnel_foreground_quiet_supported:
+        options.append(
+            b"foreground             = yes|quiet|no foreground mode (don't fork, log to stderr)"
+        )
+
     mocker.patch(
-        "mount_efs.get_version_specific_stunnel_options",
-        return_value=(
-            stunnel_check_cert_hostname_supported,
-            stunnel_check_cert_validity_supported,
-        ),
+        "mount_efs.get_stunnel_options",
+        return_value=options,
     )
 
     if stunnel_check_cert_hostname is None:
@@ -77,6 +94,8 @@ def _get_config(
             mount_efs.CONFIG_SECTION, "stunnel_logs_file", str(stunnel_logs_file)
         )
 
+    config.set(mount_efs.CONFIG_SECTION, "fips_mode_enabled", str(fips_mode_enabled))
+
     return config
 
 
@@ -85,6 +104,20 @@ def _get_mount_options(port=PORT):
         "tlsport": port,
     }
     return options
+
+
+def _get_expected_global_config(
+    fs_id,
+    mountpoint,
+    tls_port,
+    state_file_dir,
+    global_config=mount_efs.STUNNEL_GLOBAL_CONFIG,
+):
+    global_config = dict(global_config)
+    mount_filename = mount_efs.get_mount_specific_filename(fs_id, mountpoint, tls_port)
+    pid_file_path = os.path.join(state_file_dir, mount_filename + "+", "stunnel.pid")
+    global_config["pid"] = pid_file_path
+    return global_config
 
 
 def _validate_config(stunnel_config_file, expected_global_config, expected_efs_config):
@@ -161,14 +194,14 @@ def _test_check_cert_hostname(
     expected_check_cert_hostname_config_value,
 ):
     ca_mocker = mocker.patch("mount_efs.add_stunnel_ca_options")
-
+    state_file_dir = str(tmpdir)
     config_file = mount_efs.write_stunnel_config_file(
         _get_config(
             mocker,
             stunnel_check_cert_hostname_supported=stunnel_check_cert_hostname_supported,
             stunnel_check_cert_hostname=stunnel_check_cert_hostname,
         ),
-        str(tmpdir),
+        state_file_dir,
         FS_ID,
         MOUNT_POINT,
         PORT,
@@ -183,7 +216,7 @@ def _test_check_cert_hostname(
 
     _validate_config(
         config_file,
-        mount_efs.STUNNEL_GLOBAL_CONFIG,
+        _get_expected_global_config(FS_ID, MOUNT_POINT, PORT, state_file_dir),
         _get_expected_efs_config(
             check_cert_hostname=expected_check_cert_hostname_config_value
         ),
@@ -198,13 +231,13 @@ def _test_check_cert_validity(
     expected_check_cert_validity_config_value,
 ):
     ca_mocker = mocker.patch("mount_efs.add_stunnel_ca_options")
-
+    state_file_dir = str(tmpdir)
     config_file = mount_efs.write_stunnel_config_file(
         _get_config(
             mocker,
             stunnel_check_cert_validity_supported=stunnel_check_cert_validity_supported,
         ),
-        str(tmpdir),
+        state_file_dir,
         FS_ID,
         MOUNT_POINT,
         PORT,
@@ -219,7 +252,7 @@ def _test_check_cert_validity(
 
     _validate_config(
         config_file,
-        mount_efs.STUNNEL_GLOBAL_CONFIG,
+        _get_expected_global_config(FS_ID, MOUNT_POINT, PORT, state_file_dir),
         _get_expected_efs_config(
             check_cert_validity=expected_check_cert_validity_config_value
         ),
@@ -245,7 +278,9 @@ def test_write_stunnel_config_file(mocker, tmpdir):
     utils.assert_called_once(ca_mocker)
 
     _validate_config(
-        config_file, mount_efs.STUNNEL_GLOBAL_CONFIG, _get_expected_efs_config()
+        config_file,
+        _get_expected_global_config(FS_ID, MOUNT_POINT, PORT, state_file_dir),
+        _get_expected_efs_config(),
     )
 
 
@@ -269,22 +304,26 @@ def test_write_stunnel_config_file_with_az_as_dns_name(mocker, tmpdir):
 
     _validate_config(
         config_file,
-        mount_efs.STUNNEL_GLOBAL_CONFIG,
+        _get_expected_global_config(FS_ID, MOUNT_POINT, PORT, state_file_dir),
         _get_expected_efs_config(dns_name=DNS_NAME_WITH_AZ),
     )
 
 
-def _test_disable_libwrap(
-    mocker, tmpdir, system_release="unknown", disable_libwrap=True
+def _test_enable_disable_libwrap(
+    mocker,
+    tmpdir,
+    system_release="unknown",
+    libwrap_supported=True,
 ):
     mocker.patch("mount_efs.add_stunnel_ca_options")
+    state_file_dir = str(tmpdir)
     ver_mocker = mocker.patch(
         "mount_efs.get_system_release_version", return_value=system_release
     )
 
     config_file = mount_efs.write_stunnel_config_file(
-        _get_config(mocker),
-        str(tmpdir),
+        _get_config(mocker, stunnel_libwrap_option_supported=libwrap_supported),
+        state_file_dir,
         FS_ID,
         MOUNT_POINT,
         PORT,
@@ -298,8 +337,8 @@ def _test_disable_libwrap(
     utils.assert_called_once(ver_mocker)
     _validate_config(
         config_file,
-        mount_efs.STUNNEL_GLOBAL_CONFIG,
-        _get_expected_efs_config(disable_libwrap=disable_libwrap),
+        _get_expected_global_config(FS_ID, MOUNT_POINT, PORT, state_file_dir),
+        _get_expected_efs_config(disable_libwrap=libwrap_supported),
     )
 
 
@@ -321,7 +360,9 @@ def test_write_stunnel_config_with_debug(mocker, tmpdir):
     )
     utils.assert_called_once(ca_mocker)
 
-    expected_global_config = dict(mount_efs.STUNNEL_GLOBAL_CONFIG)
+    expected_global_config = dict(
+        _get_expected_global_config(FS_ID, MOUNT_POINT, PORT, state_file_dir)
+    )
     expected_global_config["debug"] = "debug"
     expected_global_config["output"] = os.path.join(
         mount_efs.LOG_DIR,
@@ -351,7 +392,9 @@ def test_write_stunnel_config_with_debug_and_logs_file(mocker, tmpdir):
     )
     utils.assert_called_once(ca_mocker)
 
-    expected_global_config = dict(mount_efs.STUNNEL_GLOBAL_CONFIG)
+    expected_global_config = dict(
+        _get_expected_global_config(FS_ID, MOUNT_POINT, PORT, state_file_dir)
+    )
     expected_global_config["debug"] = "debug"
     expected_global_config["output"] = STUNNEL_LOGS_FILE
 
@@ -516,11 +559,11 @@ def test_write_stunnel_config_check_cert_validity_not_supported_ocsp_enabled(
 
 def test_write_stunnel_config_with_verify_level(mocker, tmpdir):
     ca_mocker = mocker.patch("mount_efs.add_stunnel_ca_options")
-
+    state_file_dir = str(tmpdir)
     verify = 0
     config_file = mount_efs.write_stunnel_config_file(
         _get_config(mocker, stunnel_check_cert_validity=True),
-        str(tmpdir),
+        state_file_dir,
         FS_ID,
         MOUNT_POINT,
         PORT,
@@ -534,33 +577,17 @@ def test_write_stunnel_config_with_verify_level(mocker, tmpdir):
 
     _validate_config(
         config_file,
-        mount_efs.STUNNEL_GLOBAL_CONFIG,
+        _get_expected_global_config(FS_ID, MOUNT_POINT, PORT, state_file_dir),
         _get_expected_efs_config(check_cert_validity=False, verify=verify),
     )
 
 
-def test_write_stunnel_config_for_rhel8_disable_libwrap(mocker, tmpdir):
-    _test_disable_libwrap(
-        mocker,
-        tmpdir,
-        system_release="Red Hat Enterprise Linux release 8.0 (Ootpa)",
-        disable_libwrap=False,
-    )
+def test_write_stunnel_config_libwrap_not_supported(mocker, tmpdir):
+    _test_enable_disable_libwrap(mocker, tmpdir, libwrap_supported=False)
 
 
-def test_write_stunnel_config_for_unknown_system_enable_libwrap(mocker, tmpdir):
-    _test_disable_libwrap(
-        mocker, tmpdir, system_release="unknown", disable_libwrap=True
-    )
-
-
-def test_write_stunnel_config_for_non_rhel8_enable_libwrap(mocker, tmpdir):
-    _test_disable_libwrap(
-        mocker,
-        tmpdir,
-        system_release="Amazon Linux release 2 (Karoo)",
-        disable_libwrap=True,
-    )
+def test_write_stunnel_config_libwrap_supported(mocker, tmpdir):
+    _test_enable_disable_libwrap(mocker, tmpdir, libwrap_supported=True)
 
 
 def test_write_stunnel_config_with_fall_back_ip_address(mocker, tmpdir):
@@ -585,6 +612,94 @@ def test_write_stunnel_config_with_fall_back_ip_address(mocker, tmpdir):
 
     _validate_config(
         config_file,
-        mount_efs.STUNNEL_GLOBAL_CONFIG,
+        _get_expected_global_config(FS_ID, MOUNT_POINT, PORT, state_file_dir),
         _get_expected_efs_config(fallback_ip_address=FALLBACK_IP_ADDRESS),
+    )
+
+
+def test_write_stunnel_config_foreground_quiet_not_supported(mocker, tmpdir):
+    _test_stunnel_config_foreground_quiet_helper(
+        mocker, tmpdir, foreground_quiet_supported=False, stunnel_debug_enabled=False
+    )
+
+
+def test_write_stunnel_config_foreground_quiet_supported(mocker, tmpdir):
+    _test_stunnel_config_foreground_quiet_helper(
+        mocker, tmpdir, foreground_quiet_supported=True, stunnel_debug_enabled=False
+    )
+
+
+def test_write_stunnel_config_foreground_quiet_supported_debug_enabled(mocker, tmpdir):
+    _test_stunnel_config_foreground_quiet_helper(
+        mocker, tmpdir, foreground_quiet_supported=True, stunnel_debug_enabled=True
+    )
+
+
+def _test_stunnel_config_foreground_quiet_helper(
+    mocker, tmpdir, foreground_quiet_supported, stunnel_debug_enabled
+):
+    ca_mocker = mocker.patch("mount_efs.add_stunnel_ca_options")
+    state_file_dir = str(tmpdir)
+
+    config_file = mount_efs.write_stunnel_config_file(
+        _get_config(
+            mocker,
+            stunnel_debug_enabled=stunnel_debug_enabled,
+            stunnel_foreground_quiet_supported=foreground_quiet_supported,
+        ),
+        state_file_dir,
+        FS_ID,
+        MOUNT_POINT,
+        PORT,
+        DNS_NAME,
+        VERIFY_LEVEL,
+        OCSP_ENABLED,
+        _get_mount_options(),
+        DEFAULT_REGION,
+    )
+    utils.assert_called_once(ca_mocker)
+
+    expected_global_config = dict(
+        _get_expected_global_config(FS_ID, MOUNT_POINT, PORT, state_file_dir)
+    )
+    expected_global_config["foreground"] = (
+        "quiet" if foreground_quiet_supported and not stunnel_debug_enabled else "yes"
+    )
+    if stunnel_debug_enabled:
+        expected_global_config["debug"] = "debug"
+        expected_global_config["output"] = os.path.join(
+            mount_efs.LOG_DIR,
+            "%s.stunnel.log"
+            % mount_efs.get_mount_specific_filename(FS_ID, MOUNT_POINT, PORT),
+        )
+    _validate_config(config_file, expected_global_config, _get_expected_efs_config())
+
+
+def test_write_stunnel_config_fips_enabled(mocker, tmpdir):
+    ca_mocker = mocker.patch("mount_efs.add_stunnel_ca_options")
+    state_file_dir = str(tmpdir)
+
+    config_file = mount_efs.write_stunnel_config_file(
+        _get_config(mocker, fips_mode_enabled=True),
+        state_file_dir,
+        FS_ID,
+        MOUNT_POINT,
+        PORT,
+        DNS_NAME,
+        VERIFY_LEVEL,
+        OCSP_ENABLED,
+        _get_mount_options(),
+        DEFAULT_REGION,
+    )
+    utils.assert_called_once(ca_mocker)
+
+    expected_global_config = dict(
+        _get_expected_global_config(FS_ID, MOUNT_POINT, PORT, state_file_dir)
+    )
+    expected_global_config["fips"] = "yes"
+
+    _validate_config(
+        config_file,
+        expected_global_config,
+        _get_expected_efs_config(),
     )

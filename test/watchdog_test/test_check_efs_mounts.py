@@ -45,15 +45,23 @@ def _get_config():
         config = ConfigParser()
     config.add_section(mount_efs.CONFIG_SECTION)
     config.set(mount_efs.CONFIG_SECTION, "state_file_dir_mode", "750")
+    config.add_section(watchdog.CONFIG_SECTION)
+    config.set(watchdog.CONFIG_SECTION, "stunnel_health_check_enabled", "false")
     return config
 
 
-def setup_mocks(mocker, mounts, state_files, is_pid_running=True):
+def setup_mocks(
+    mocker, mounts, state_files, is_stunnel_process_running=True, is_pid_running=True
+):
     state = dict(STATE)
     state["unmount_time"] = TIME - GRACE_PERIOD
 
     mocker.patch("watchdog.get_current_local_nfs_mounts", return_value=mounts)
     mocker.patch("watchdog.get_state_files", return_value=state_files)
+    mocker.patch(
+        "watchdog.is_mount_stunnel_proc_running",
+        return_value=is_stunnel_process_running,
+    )
     mocker.patch("watchdog.is_pid_running", return_value=is_pid_running)
     mocker.patch("time.time", return_value=TIME + GRACE_PERIOD + 1)
 
@@ -75,7 +83,7 @@ def setup_mocks(mocker, mounts, state_files, is_pid_running=True):
 
 
 def create_state_file(tmpdir, content=json.dumps(STATE)):
-    state_file = tmpdir.join(tempfile.mktemp())
+    state_file = tmpdir.join(tempfile.mkstemp()[1])
     state_file.write(content, ensure=True)
 
     return state_file.dirname, state_file.basename
@@ -214,6 +222,7 @@ def test_tls_not_running(mocker, tmpdir):
         mocker,
         mounts={"mnt": watchdog.Mount("127.0.0.1", "/mnt", "nfs4", "", "0", "0")},
         state_files={"mnt": state_file},
+        is_stunnel_process_running=False,
         is_pid_running=False,
     )
 
@@ -239,6 +248,7 @@ def test_tls_not_running_due_to_pid_clean_up(mocker, tmpdir):
         mocker,
         mounts={"mnt": watchdog.Mount("127.0.0.1", "/mnt", "nfs4", "", "0", "0")},
         state_files={"mnt": state_file},
+        is_stunnel_process_running=False,
         is_pid_running=True,
     )
 

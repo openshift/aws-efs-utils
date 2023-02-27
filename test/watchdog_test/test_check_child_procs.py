@@ -5,9 +5,8 @@
 # the License.
 
 import watchdog
-from mock import MagicMock
 
-from .. import utils
+from .. import common, utils
 
 
 def test_child_procs_empty():
@@ -17,8 +16,10 @@ def test_child_procs_empty():
 
 
 def test_child_procs():
-    live_proc = MagicMock(returncode=None)
-    dead_proc = MagicMock(returncode=1)
+    live_proc = common.PopenMock(return_code=None).mock
+    dead_proc = common.PopenMock(
+        return_code=1, communicate_return_value=(None, None)
+    ).mock
 
     children = [live_proc, dead_proc]
 

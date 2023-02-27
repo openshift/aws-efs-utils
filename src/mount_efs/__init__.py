@@ -46,7 +46,6 @@ import subprocess
 import sys
 import threading
 import time
-
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
@@ -63,19 +62,21 @@ except ImportError:
     from urllib import quote_plus
 
 try:
-    from urllib.request import urlopen, Request
-    from urllib.error import URLError, HTTPError
+    from urllib.error import HTTPError, URLError
     from urllib.parse import urlencode
+    from urllib.request import Request, urlopen
 except ImportError:
-    from urllib2 import URLError, HTTPError, build_opener, urlopen, Request, HTTPHandler
     from urllib import urlencode
 
+    from urllib2 import HTTPError, HTTPHandler, Request, URLError, build_opener, urlopen
+
 try:
+    import botocore.config
     import botocore.session
     from botocore.exceptions import (
         ClientError,
-        NoCredentialsError,
         EndpointConnectionError,
+        NoCredentialsError,
         ProfileNotFound,
     )
 
@@ -84,8 +85,15 @@ except ImportError:
     BOTOCORE_PRESENT = False
 
 
-VERSION = "1.31.3"
+VERSION = "1.34.5"
 SERVICE = "elasticfilesystem"
+
+AMAZON_LINUX_2_RELEASE_ID = "Amazon Linux release 2 (Karoo)"
+AMAZON_LINUX_2_PRETTY_NAME = "Amazon Linux 2"
+AMAZON_LINUX_2_RELEASE_VERSIONS = [
+    AMAZON_LINUX_2_RELEASE_ID,
+    AMAZON_LINUX_2_PRETTY_NAME,
+]
 
 CLONE_NEWNET = 0x40000000
 CONFIG_FILE = "/etc/amazon/efs/efs-utils.conf"
@@ -102,11 +110,14 @@ DEFAULT_UNKNOWN_VALUE = "unknown"
 # 50ms
 DEFAULT_TIMEOUT = 0.05
 DEFAULT_MACOS_VALUE = "macos"
+DEFAULT_NFS_MOUNT_COMMAND_RETRY_COUNT = 3
+DEFAULT_NFS_MOUNT_COMMAND_TIMEOUT_SEC = 15
 DISABLE_FETCH_EC2_METADATA_TOKEN_ITEM = "disable_fetch_ec2_metadata_token"
 FALLBACK_TO_MOUNT_TARGET_IP_ADDRESS_ITEM = (
     "fall_back_to_mount_target_ip_address_enabled"
 )
 INSTANCE_IDENTITY = None
+RETRYABLE_ERRORS = ["reset by peer"]
 OPTIMIZE_READAHEAD_ITEM = "optimize_readahead"
 
 LOG_DIR = "/var/log/amazon/efs"
@@ -181,10 +192,7 @@ EFS_FQDN_RE = re.compile(
 AP_ID_RE = re.compile("^fsap-[0-9a-f]{17}$")
 
 CREDENTIALS_KEYS = ["AccessKeyId", "SecretAccessKey", "Token"]
-ECS_URI_ENV = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
 ECS_TASK_METADATA_API = "http://169.254.170.2"
-WEB_IDENTITY_ROLE_ARN_ENV = "AWS_ROLE_ARN"
-WEB_IDENTITY_TOKEN_FILE_ENV = "AWS_WEB_IDENTITY_TOKEN_FILE"
 STS_ENDPOINT_URL_FORMAT = "https://sts.{}.amazonaws.com/"
 INSTANCE_METADATA_TOKEN_URL = "http://169.254.169.254/latest/api/token"
 INSTANCE_METADATA_SERVICE_URL = (
@@ -258,36 +266,26 @@ WATCHDOG_SERVICE = "amazon-efs-mount-watchdog"
 WATCHDOG_SERVICE_PLIST_PATH = "/Library/LaunchAgents/amazon-efs-mount-watchdog.plist"
 SYSTEM_RELEASE_PATH = "/etc/system-release"
 OS_RELEASE_PATH = "/etc/os-release"
-RHEL8_RELEASE_NAME = "Red Hat Enterprise Linux release 8"
-CENTOS8_RELEASE_NAME = "CentOS Linux release 8"
-ORACLE_RELEASE_NAME = "Oracle Linux Server release 8"
-FEDORA_RELEASE_NAME = "Fedora release"
-OPEN_SUSE_LEAP_RELEASE_NAME = "openSUSE Leap"
-SUSE_RELEASE_NAME = "SUSE Linux Enterprise Server"
 MACOS_BIG_SUR_RELEASE = "macOS-11"
-
-SKIP_NO_LIBWRAP_RELEASES = [
-    RHEL8_RELEASE_NAME,
-    CENTOS8_RELEASE_NAME,
-    FEDORA_RELEASE_NAME,
-    OPEN_SUSE_LEAP_RELEASE_NAME,
-    SUSE_RELEASE_NAME,
-    MACOS_BIG_SUR_RELEASE,
-    ORACLE_RELEASE_NAME,
-]
+MACOS_MONTEREY_RELEASE = "macOS-12"
 
 # Multiplier for max read ahead buffer size
 # Set default as 15 aligning with prior linux kernel 5.4
 DEFAULT_NFS_MAX_READAHEAD_MULTIPLIER = 15
-NFS_READAHEAD_CONFIG_PATH_FORMAT = "/sys/class/bdi/0:%s/read_ahead_kb"
+NFS_READAHEAD_CONFIG_PATH_FORMAT = "/sys/class/bdi/%s:%s/read_ahead_kb"
 NFS_READAHEAD_OPTIMIZE_LINUX_KERNEL_MIN_VERSION = [5, 4]
 
 # MacOS does not support the property of Socket SO_BINDTODEVICE in stunnel configuration
-SKIP_NO_SO_BINDTODEVICE_RELEASES = [MACOS_BIG_SUR_RELEASE]
+SKIP_NO_SO_BINDTODEVICE_RELEASES = [MACOS_BIG_SUR_RELEASE, MACOS_MONTEREY_RELEASE]
 
 MAC_OS_PLATFORM_LIST = ["darwin"]
-# MacOS Versions : Big Sur - 20.*, Catalina - 19.*, Mojave - 18.*. Catalina and Mojave are not supported for now
-MAC_OS_SUPPORTED_VERSION_LIST = ["20"]
+# MacOS Versions : Monterey - 21.*, Big Sur - 20.*, Catalina - 19.*, Mojave - 18.*. Catalina and Mojave are not supported for now
+MAC_OS_SUPPORTED_VERSION_LIST = ["20", "21"]
+
+AWS_FIPS_ENDPOINT_CONFIG_ENV = "AWS_USE_FIPS_ENDPOINT"
+ECS_URI_ENV = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
+WEB_IDENTITY_ROLE_ARN_ENV = "AWS_ROLE_ARN"
+WEB_IDENTITY_TOKEN_FILE_ENV = "AWS_WEB_IDENTITY_TOKEN_FILE"
 
 
 def errcheck(ret, func, args):
@@ -886,6 +884,13 @@ def url_request_helper(config, url, unsuccessful_resp, url_error_msg, headers={}
 
 
 def get_resp_obj(request_resp, url, unsuccessful_resp):
+    """
+    Parse the response of an url request
+
+    :return: If the response result can be parsed into json object, return the json object parsed from the response.
+             Otherwise return the response body in string format.
+    """
+
     if request_resp.getcode() != 200:
         logging.debug(
             unsuccessful_resp + " %s: ResponseCode=%d", url, request_resp.getcode()
@@ -905,11 +910,7 @@ def get_resp_obj(request_resp, url, unsuccessful_resp):
             )
 
         return resp_dict
-    except ValueError as e:
-        logging.info(
-            'ValueError parsing "%s" into json: %s. Returning response body.'
-            % (str(resp_body), e)
-        )
+    except ValueError:
         return resp_body if resp_body_type is str else resp_body.decode("utf-8")
 
 
@@ -938,28 +939,29 @@ def get_tls_port_range(config):
     return lower_bound, upper_bound
 
 
-def choose_tls_port(config, options):
+def choose_tls_port_and_get_bind_sock(config, options, state_file_dir):
     if "tlsport" in options:
         ports_to_try = [int(options["tlsport"])]
     else:
         lower_bound, upper_bound = get_tls_port_range(config)
 
-        tls_ports = list(range(lower_bound, upper_bound))
+        ports_to_try = list(range(lower_bound, upper_bound))
 
-        # Choose a random midpoint, and then try ports in-order from there
-        mid = random.randrange(len(tls_ports))
-
-        ports_to_try = tls_ports[mid:] + tls_ports[:mid]
-        assert len(tls_ports) == len(ports_to_try)
+        # shuffle the ports_to_try to reduce possibility of multiple mounts starting from same port range
+        random.shuffle(ports_to_try)
 
     if "netns" not in options:
-        tls_port = find_tls_port_in_range(ports_to_try)
+        tls_port_sock = find_tls_port_in_range_and_get_bind_sock(
+            ports_to_try, state_file_dir
+        )
     else:
         with NetNS(nspath=options["netns"]):
-            tls_port = find_tls_port_in_range(ports_to_try)
+            tls_port_sock = find_tls_port_in_range_and_get_bind_sock(
+                ports_to_try, state_file_dir
+            )
 
-    if tls_port:
-        return tls_port
+    if tls_port_sock:
+        return tls_port_sock
 
     if "tlsport" in options:
         fatal_error(
@@ -973,18 +975,41 @@ def choose_tls_port(config, options):
         )
 
 
-def find_tls_port_in_range(ports_to_try):
+def find_tls_port_in_range_and_get_bind_sock(ports_to_try, state_file_dir):
     sock = socket.socket()
     for tls_port in ports_to_try:
+        mount = find_existing_mount_using_tls_port(state_file_dir, tls_port)
+        if mount:
+            logging.debug(
+                "Skip binding TLS port %s as it is already assigned to %s",
+                tls_port,
+                mount,
+            )
+            continue
         try:
             logging.info("binding %s", tls_port)
             sock.bind(("localhost", tls_port))
-            sock.close()
-            return tls_port
+            return sock
         except socket.error as e:
-            logging.info(e)
+            logging.warning(e)
             continue
     sock.close()
+    return None
+
+
+def find_existing_mount_using_tls_port(state_file_dir, tls_port):
+    if not os.path.exists(state_file_dir):
+        logging.debug(
+            "State file dir %s does not exist, assuming no existing mount using tls port %s",
+            state_file_dir,
+            tls_port,
+        )
+        return None
+
+    for fname in os.listdir(state_file_dir):
+        if fname.endswith(".%s" % tls_port):
+            return fname
+
     return None
 
 
@@ -1060,20 +1085,36 @@ def get_config_section(config, region):
     return config_section
 
 
-def is_stunnel_option_supported(stunnel_output, stunnel_option_name):
+def is_stunnel_option_supported(
+    stunnel_output,
+    stunnel_option_name,
+    stunnel_option_value=None,
+    emit_warning_log=True,
+):
     supported = False
     for line in stunnel_output:
         if line.startswith(stunnel_option_name):
-            supported = True
-            break
+            if not stunnel_option_value:
+                supported = True
+                break
+            elif stunnel_option_value and stunnel_option_value in line:
+                supported = True
+                break
 
-    if not supported:
-        logging.warning('stunnel does not support "%s"', stunnel_option_name)
+    if not supported and emit_warning_log:
+        if not stunnel_option_value:
+            logging.warning('stunnel does not support "%s"', stunnel_option_name)
+        else:
+            logging.warning(
+                'stunnel does not support "%s" as value of "%s"',
+                stunnel_option_value,
+                stunnel_option_name,
+            )
 
     return supported
 
 
-def get_version_specific_stunnel_options():
+def get_stunnel_options():
     stunnel_command = [_stunnel_bin(), "-help"]
     proc = subprocess.Popen(
         stunnel_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True
@@ -1081,34 +1122,36 @@ def get_version_specific_stunnel_options():
     proc.wait()
     _, err = proc.communicate()
 
-    stunnel_output = err.splitlines()
-
-    check_host_supported = is_stunnel_option_supported(stunnel_output, b"checkHost")
-    ocsp_aia_supported = is_stunnel_option_supported(stunnel_output, b"OCSPaia")
-
-    return check_host_supported, ocsp_aia_supported
+    return err.splitlines()
 
 
 def _stunnel_bin():
-    return find_command_path(
-        "stunnel",
-        "Please install it following the instructions at "
-        "https://docs.aws.amazon.com/efs/latest/ug/using-amazon-efs-utils.html#upgrading-stunnel",
-    )
+    installation_message = "Please install it following the instructions at: https://docs.aws.amazon.com/efs/latest/ug/using-amazon-efs-utils.html#upgrading-stunnel"
+    if get_system_release_version() in AMAZON_LINUX_2_RELEASE_VERSIONS:
+        return find_command_path("stunnel5", installation_message)
+    else:
+        return find_command_path("stunnel", installation_message)
 
 
 def find_command_path(command, install_method):
-    try:
+    # If not running on macOS, use linux paths
+    if not check_if_platform_is_mac():
         env_path = (
             "/sbin:/usr/sbin:/usr/local/sbin:/root/bin:/usr/local/bin:/usr/bin:/bin"
         )
-        os.putenv("PATH", env_path)
+    # Homebrew on x86 macOS uses /usr/local/bin; Homebrew on Apple Silicon macOS uses /opt/homebrew/bin since v3.0.0
+    # For more information, see https://brew.sh/2021/02/05/homebrew-3.0.0/
+    else:
+        env_path = "/opt/homebrew/bin:/usr/local/bin"
+    os.putenv("PATH", env_path)
+
+    try:
         path = subprocess.check_output(["which", command])
+        return path.strip().decode()
     except subprocess.CalledProcessError as e:
         fatal_error(
             "Failed to locate %s in %s - %s" % (command, env_path, install_method), e
         )
-    return path.strip().decode()
 
 
 def get_system_release_version():
@@ -1153,10 +1196,18 @@ def write_stunnel_config_file(
     hand-serialize it.
     """
 
+    stunnel_options = get_stunnel_options()
     mount_filename = get_mount_specific_filename(fs_id, mountpoint, tls_port)
 
     system_release_version = get_system_release_version()
     global_config = dict(STUNNEL_GLOBAL_CONFIG)
+
+    if is_stunnel_option_supported(
+        stunnel_options, b"foreground", b"quiet", emit_warning_log=False
+    ):
+        # Do not log to stderr of subprocess in addition to the destinations specified with syslog and output.
+        # Only support in stunnel version 5.25+.
+        global_config["foreground"] = "quiet"
     if any(
         release in system_release_version
         for release in SKIP_NO_SO_BINDTODEVICE_RELEASES
@@ -1167,7 +1218,9 @@ def write_stunnel_config_file(
         config, CONFIG_SECTION, "stunnel_debug_enabled", default_value=False
     ):
         global_config["debug"] = "debug"
-
+        # If the stunnel debug is enabled, we also redirect stunnel log to stderr to capture any error while launching
+        # the stunnel.
+        global_config["foreground"] = "yes"
         if config.has_option(CONFIG_SECTION, "stunnel_logs_file"):
             global_config["output"] = config.get(
                 CONFIG_SECTION, "stunnel_logs_file"
@@ -1176,6 +1229,11 @@ def write_stunnel_config_file(
             global_config["output"] = os.path.join(
                 log_dir, "%s.stunnel.log" % mount_filename
             )
+    global_config["pid"] = os.path.join(
+        state_file_dir, mount_filename + "+", "stunnel.pid"
+    )
+    if get_fips_config(config):
+        global_config["fips"] = "yes"
 
     efs_config = dict(STUNNEL_EFS_CONFIG)
     efs_config["accept"] = efs_config["accept"] % tls_port
@@ -1193,8 +1251,6 @@ def write_stunnel_config_file(
         efs_config["cert"] = cert_details["certificate"]
         efs_config["key"] = cert_details["privateKey"]
 
-    check_host_supported, ocsp_aia_supported = get_version_specific_stunnel_options()
-
     tls_controls_message = (
         "WARNING: Your client lacks sufficient controls to properly enforce TLS. Please upgrade stunnel, "
         'or disable "%%s" in %s.\nSee %s for more detail.'
@@ -1204,7 +1260,7 @@ def write_stunnel_config_file(
     if get_boolean_config_item_value(
         config, CONFIG_SECTION, "stunnel_check_cert_hostname", default_value=True
     ):
-        if check_host_supported:
+        if is_stunnel_option_supported(stunnel_options, b"checkHost"):
             # Stunnel checkHost option checks if the specified DNS host name or wildcard matches any of the provider in peer
             # certificate's CN fields, after introducing the AZ field in dns name, the host name in the stunnel config file
             # is not valid, remove the az info there
@@ -1214,14 +1270,14 @@ def write_stunnel_config_file(
 
     # Only use the config setting if the override is not set
     if ocsp_enabled:
-        if ocsp_aia_supported:
+        if is_stunnel_option_supported(stunnel_options, b"OCSPaia"):
             efs_config["OCSPaia"] = "yes"
         else:
             fatal_error(tls_controls_message % "stunnel_check_cert_validity")
 
-    if not any(
-        release in system_release_version for release in SKIP_NO_LIBWRAP_RELEASES
-    ):
+    # If the stunnel libwrap option is supported, we disable the usage of /etc/hosts.allow and /etc/hosts.deny by
+    # setting the option to no
+    if is_stunnel_option_supported(stunnel_options, b"libwrap"):
         efs_config["libwrap"] = "no"
 
     stunnel_config = "\n".join(
@@ -1261,6 +1317,7 @@ def write_tls_tunnel_state_file(
         "cmd": command,
         "files": files,
         "mount_time": time.time(),
+        "mountpoint": mountpoint,
     }
 
     if cert_details:
@@ -1272,14 +1329,34 @@ def write_tls_tunnel_state_file(
     return state_file
 
 
+def rewrite_tls_tunnel_state_file(state, state_file_dir, state_file):
+    with open(os.path.join(state_file_dir, state_file), "w") as f:
+        json.dump(state, f)
+    return state_file
+
+
+def update_tls_tunnel_temp_state_file_with_tunnel_pid(
+    temp_tls_state_file, state_file_dir, stunnel_pid
+):
+    with open(os.path.join(state_file_dir, temp_tls_state_file), "r") as f:
+        state = json.load(f)
+    state["pid"] = stunnel_pid
+    temp_tls_state_file = rewrite_tls_tunnel_state_file(
+        state, state_file_dir, temp_tls_state_file
+    )
+    return temp_tls_state_file
+
+
 def test_tunnel_process(tunnel_proc, fs_id):
     tunnel_proc.poll()
     if tunnel_proc.returncode is not None:
-        out, err = tunnel_proc.communicate()
+        _, err = tunnel_proc.communicate()
         fatal_error(
-            "Failed to initialize TLS tunnel for %s" % fs_id,
-            'Failed to start TLS tunnel (errno=%d). stdout="%s" stderr="%s"'
-            % (tunnel_proc.returncode, out.strip(), err.strip()),
+            "Failed to initialize TLS tunnel for %s, please check mount.log for the failure reason."
+            % fs_id,
+            'Failed to start TLS tunnel (errno=%d), stderr="%s". If the stderr is lacking enough details, please '
+            "enable stunnel debug log in efs-utils config file and retry the mount to capture more info."
+            % (tunnel_proc.returncode, err.strip()),
         )
 
 
@@ -1313,22 +1390,18 @@ def get_init_system(comm_file="/proc/1/comm"):
 
 def check_network_target(fs_id):
     with open(os.devnull, "w") as devnull:
-        if not check_if_platform_is_mac():
-            rc = subprocess.call(
-                ["systemctl", "status", "network.target"],
-                stdout=devnull,
-                stderr=devnull,
-                close_fds=True,
-            )
-        else:
-            rc = subprocess.call(
-                ["sudo", "ifconfig", "en0"],
-                stdout=devnull,
-                stderr=devnull,
-                close_fds=True,
-            )
+        rc = subprocess.call(
+            ["systemctl", "is-active", "network.target"],
+            stdout=devnull,
+            stderr=devnull,
+            close_fds=True,
+        )
 
     if rc != 0:
+        # For fstab mount, the exit code 0 below is to avoid non-zero exit status causing instance to fail the
+        # local-fs.target boot up and then fail the network setup failure can result in the instance being unresponsive.
+        # https://docs.amazonaws.cn/en_us/efs/latest/ug/troubleshooting-efs-mounting.html#automount-fails
+        #
         fatal_error(
             'Failed to mount %s because the network was not yet available, add "_netdev" to your mount options'
             % fs_id,
@@ -1336,6 +1409,15 @@ def check_network_target(fs_id):
         )
 
 
+# This network status check is necessary for the fstab automount use case and should not be removed.
+# efs-utils relies on the network to retrieve the instance metadata and get information e.g. region, to further parse
+# the DNS name of file system to mount target IP address, we need a way to inform users to add `_netdev` option to fstab
+# entry if they haven't do so.
+#
+# However, network.target status itself cannot accurately reflect the status of network reachability.
+# We will replace this check with other accurate way such that even network.target is turned off while network is
+# reachable, the mount can still proceed.
+#
 def check_network_status(fs_id, init_system):
     if init_system != "systemd":
         logging.debug("Not testing network on non-systemd init systems")
@@ -1429,6 +1511,13 @@ def create_required_directory(config, directory):
             raise
 
 
+# Example of a localhost bind sock: sock.bind(('localhost',12345))
+# sock.getsockname() -> ('127.0.0.1', 12345)
+# This function returns the port of the bind socket, in the example is 12345
+def get_tls_port_from_sock(tls_port_sock):
+    return tls_port_sock.getsockname()[1]
+
+
 @contextmanager
 def bootstrap_tls(
     config,
@@ -1440,106 +1529,118 @@ def bootstrap_tls(
     state_file_dir=STATE_FILE_DIR,
     fallback_ip_address=None,
 ):
-    tls_port = choose_tls_port(config, options)
-    # override the tlsport option so that we can later override the port the NFS client uses to connect to stunnel.
-    # if the user has specified tlsport=X at the command line this will just re-set tlsport to X.
-    options["tlsport"] = tls_port
+    tls_port_sock = choose_tls_port_and_get_bind_sock(config, options, state_file_dir)
+    tls_port = get_tls_port_from_sock(tls_port_sock)
 
-    use_iam = "iam" in options
-    ap_id = options.get("accesspoint")
-    cert_details = {}
-    security_credentials = None
-    client_info = get_client_info(config)
-    region = get_target_region(config)
+    try:
+        # override the tlsport option so that we can later override the port the NFS client uses to connect to stunnel.
+        # if the user has specified tlsport=X at the command line this will just re-set tlsport to X.
+        options["tlsport"] = tls_port
 
-    if use_iam:
-        aws_creds_uri = options.get("awscredsuri")
-        if aws_creds_uri:
-            kwargs = {"aws_creds_uri": aws_creds_uri}
-        else:
-            kwargs = {"awsprofile": get_aws_profile(options, use_iam)}
+        use_iam = "iam" in options
+        ap_id = options.get("accesspoint")
+        cert_details = {}
+        security_credentials = None
+        client_info = get_client_info(config)
+        region = get_target_region(config)
 
-        security_credentials, credentials_source = get_aws_security_credentials(
-            config, use_iam, region, **kwargs
+        if use_iam:
+            aws_creds_uri = options.get("awscredsuri")
+            if aws_creds_uri:
+                kwargs = {"aws_creds_uri": aws_creds_uri}
+            else:
+                kwargs = {"awsprofile": get_aws_profile(options, use_iam)}
+
+            security_credentials, credentials_source = get_aws_security_credentials(
+                config, use_iam, region, **kwargs
+            )
+
+            if credentials_source:
+                cert_details["awsCredentialsMethod"] = credentials_source
+
+        if ap_id:
+            cert_details["accessPoint"] = ap_id
+
+        # additional symbol appended to avoid naming collisions
+        cert_details["mountStateDir"] = (
+            get_mount_specific_filename(fs_id, mountpoint, tls_port) + "+"
         )
+        # common name for certificate signing request is max 64 characters
+        cert_details["commonName"] = socket.gethostname()[0:64]
+        cert_details["region"] = region
+        cert_details["certificateCreationTime"] = create_certificate(
+            config,
+            cert_details["mountStateDir"],
+            cert_details["commonName"],
+            cert_details["region"],
+            fs_id,
+            security_credentials,
+            ap_id,
+            client_info,
+            base_path=state_file_dir,
+        )
+        cert_details["certificate"] = os.path.join(
+            state_file_dir, cert_details["mountStateDir"], "certificate.pem"
+        )
+        cert_details["privateKey"] = get_private_key_path()
+        cert_details["fsId"] = fs_id
 
-        if credentials_source:
-            cert_details["awsCredentialsMethod"] = credentials_source
+        start_watchdog(init_system)
 
-    if ap_id:
-        cert_details["accessPoint"] = ap_id
+        if not os.path.exists(state_file_dir):
+            create_required_directory(config, state_file_dir)
 
-    # additional symbol appended to avoid naming collisions
-    cert_details["mountStateDir"] = (
-        get_mount_specific_filename(fs_id, mountpoint, tls_port) + "+"
-    )
-    # common name for certificate signing request is max 64 characters
-    cert_details["commonName"] = socket.gethostname()[0:64]
-    region = get_target_region(config)
-    cert_details["region"] = region
-    cert_details["certificateCreationTime"] = create_certificate(
-        config,
-        cert_details["mountStateDir"],
-        cert_details["commonName"],
-        cert_details["region"],
-        fs_id,
-        security_credentials,
-        ap_id,
-        client_info,
-        base_path=state_file_dir,
-    )
-    cert_details["certificate"] = os.path.join(
-        state_file_dir, cert_details["mountStateDir"], "certificate.pem"
-    )
-    cert_details["privateKey"] = get_private_key_path()
-    cert_details["fsId"] = fs_id
+        verify_level = int(options.get("verify", DEFAULT_STUNNEL_VERIFY_LEVEL))
+        ocsp_enabled = is_ocsp_enabled(config, options)
 
-    start_watchdog(init_system)
+        stunnel_config_file = write_stunnel_config_file(
+            config,
+            state_file_dir,
+            fs_id,
+            mountpoint,
+            tls_port,
+            dns_name,
+            verify_level,
+            ocsp_enabled,
+            options,
+            region,
+            cert_details=cert_details,
+            fallback_ip_address=fallback_ip_address,
+        )
+        tunnel_args = [_stunnel_bin(), stunnel_config_file]
+        if "netns" in options:
+            tunnel_args = ["nsenter", "--net=" + options["netns"]] + tunnel_args
 
-    if not os.path.exists(state_file_dir):
-        create_required_directory(config, state_file_dir)
-
-    verify_level = int(options.get("verify", DEFAULT_STUNNEL_VERIFY_LEVEL))
-    ocsp_enabled = is_ocsp_enabled(config, options)
-
-    stunnel_config_file = write_stunnel_config_file(
-        config,
-        state_file_dir,
-        fs_id,
-        mountpoint,
-        tls_port,
-        dns_name,
-        verify_level,
-        ocsp_enabled,
-        options,
-        region,
-        cert_details=cert_details,
-        fallback_ip_address=fallback_ip_address,
-    )
-    tunnel_args = [_stunnel_bin(), stunnel_config_file]
-    if "netns" in options:
-        tunnel_args = ["nsenter", "--net=" + options["netns"]] + tunnel_args
+        # This temp state file is acting like a tlsport lock file, which is why pid =- 1
+        temp_tls_state_file = write_tls_tunnel_state_file(
+            fs_id,
+            mountpoint,
+            tls_port,
+            -1,
+            tunnel_args,
+            [stunnel_config_file],
+            state_file_dir,
+            cert_details=cert_details,
+        )
+    finally:
+        # Always close the socket we created when choosing TLS port only until now to
+        # 1. avoid concurrent TLS mount port collision 2. enable stunnel process to bind the port
+        logging.debug("Closing socket used to choose TLS port %s.", tls_port)
+        tls_port_sock.close()
 
     # launch the tunnel in a process group so if it has any child processes, they can be killed easily by the mount watchdog
     logging.info('Starting TLS tunnel: "%s"', " ".join(tunnel_args))
     tunnel_proc = subprocess.Popen(
         tunnel_args,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         preexec_fn=os.setsid,
         close_fds=True,
     )
     logging.info("Started TLS tunnel, pid: %d", tunnel_proc.pid)
 
-    temp_tls_state_file = write_tls_tunnel_state_file(
-        fs_id,
-        mountpoint,
-        tls_port,
-        tunnel_proc.pid,
-        tunnel_args,
-        [stunnel_config_file],
-        state_file_dir,
-        cert_details=cert_details,
+    update_tls_tunnel_temp_state_file_with_tunnel_pid(
+        temp_tls_state_file, state_file_dir, tunnel_proc.pid
     )
 
     if "netns" not in options:
@@ -1562,8 +1663,8 @@ def test_tlsport(tlsport):
     while not verify_tlsport_can_be_connected(tlsport) and retry_times > 0:
         logging.debug(
             "The tlsport %s cannot be connected yet, sleep %s(s), %s retry time(s) left",
-            DEFAULT_TIMEOUT,
             tlsport,
+            DEFAULT_TIMEOUT,
             retry_times,
         )
         time.sleep(DEFAULT_TIMEOUT)
@@ -1649,6 +1750,11 @@ def mount_nfs(config, dns_name, path, mountpoint, options, fallback_ip_address=N
     if "netns" in options:
         command = ["nsenter", "--net=" + options["netns"]] + command
 
+    if call_nfs_mount_command_with_retry_succeed(
+        config, options, command, dns_name, mountpoint
+    ):
+        return
+
     logging.info('Executing: "%s"', " ".join(command))
 
     proc = subprocess.Popen(
@@ -1657,12 +1763,7 @@ def mount_nfs(config, dns_name, path, mountpoint, options, fallback_ip_address=N
     out, err = proc.communicate()
 
     if proc.returncode == 0:
-        message = "Successfully mounted %s at %s" % (dns_name, mountpoint)
-        logging.info(message)
-        publish_cloudwatch_log(CLOUDWATCHLOG_AGENT, message)
-
-        # only perform readahead optimize after mount succeed
-        optimize_readahead_window(mountpoint, options, config)
+        post_mount_nfs_success(config, options, dns_name, mountpoint)
     else:
         message = 'Failed to mount %s at %s: returncode=%d, stderr="%s"' % (
             dns_name,
@@ -1671,6 +1772,156 @@ def mount_nfs(config, dns_name, path, mountpoint, options, fallback_ip_address=N
             err.strip(),
         )
         fatal_error(err.strip(), message, proc.returncode)
+
+
+def post_mount_nfs_success(config, options, dns_name, mountpoint):
+    message = "Successfully mounted %s at %s" % (dns_name, mountpoint)
+    logging.info(message)
+    publish_cloudwatch_log(CLOUDWATCHLOG_AGENT, message)
+
+    # only perform readahead optimize after mount succeed
+    optimize_readahead_window(mountpoint, options, config)
+
+
+def call_nfs_mount_command_with_retry_succeed(
+    config, options, command, dns_name, mountpoint
+):
+    def backoff_function(i):
+        """Backoff exponentially and add a constant 0-1 second jitter"""
+        return (1.5 ** i) + random.random()
+
+    if not get_boolean_config_item_value(
+        config, CONFIG_SECTION, "retry_nfs_mount_command", default_value=True
+    ):
+        logging.debug(
+            "Configuration 'retry_nfs_mount_command' is not enabled, skip retrying mount.nfs command."
+        )
+        return
+
+    retry_nfs_mount_command_timeout_sec = get_int_value_from_config_file(
+        config,
+        "retry_nfs_mount_command_timeout_sec",
+        DEFAULT_NFS_MOUNT_COMMAND_TIMEOUT_SEC,
+    )
+    retry_count = get_int_value_from_config_file(
+        config,
+        "retry_nfs_mount_command_count",
+        DEFAULT_NFS_MOUNT_COMMAND_RETRY_COUNT,
+    )
+
+    for retry in range(retry_count - 1):
+        retry_sleep_time_sec = backoff_function(retry)
+        err = "unknown error"
+        logging.info(
+            'Executing: "%s" with %s sec time limit.'
+            % (" ".join(command), retry_nfs_mount_command_timeout_sec)
+        )
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True
+        )
+
+        try:
+            out, err = proc.communicate(timeout=retry_nfs_mount_command_timeout_sec)
+            rc = proc.poll()
+            if rc != 0:
+                continue_retry = any(
+                    error_string in str(err) for error_string in RETRYABLE_ERRORS
+                )
+                if continue_retry:
+                    logging.error(
+                        'Mounting %s to %s failed, return code=%s, stdout="%s", stderr="%s", mount attempt %d/%d, '
+                        "wait %d sec before next attempt."
+                        % (
+                            dns_name,
+                            mountpoint,
+                            rc,
+                            out,
+                            err,
+                            retry + 1,
+                            retry_count,
+                            retry_sleep_time_sec,
+                        )
+                    )
+                else:
+                    message = 'Failed to mount %s at %s: returncode=%d, stderr="%s"' % (
+                        dns_name,
+                        mountpoint,
+                        proc.returncode,
+                        err.strip(),
+                    )
+                    fatal_error(err.strip(), message, proc.returncode)
+            else:
+                post_mount_nfs_success(config, options, dns_name, mountpoint)
+                return True
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except OSError:
+                # Silently fail if the subprocess has exited already
+                pass
+            retry_sleep_time_sec = 0
+            err = "timeout after %s sec" % retry_nfs_mount_command_timeout_sec
+            logging.error(
+                "Mounting %s to %s failed due to %s, mount attempt %d/%d, wait %d sec before next attempt."
+                % (
+                    dns_name,
+                    mountpoint,
+                    err,
+                    retry + 1,
+                    retry_count,
+                    retry_sleep_time_sec,
+                )
+            )
+        except Exception as e:
+            message = 'Failed to mount %s at %s: returncode=%d, stderr="%s", %s' % (
+                dns_name,
+                mountpoint,
+                proc.returncode,
+                err.strip(),
+                e,
+            )
+            fatal_error(err.strip(), message, proc.returncode)
+
+        sys.stderr.write(
+            "Mount attempt %d/%d failed due to %s, wait %d sec before next attempt.\n"
+            % (retry + 1, retry_count, err, retry_sleep_time_sec)
+        )
+        time.sleep(retry_sleep_time_sec)
+
+    return False
+
+
+def get_int_value_from_config_file(config, config_name, default_config_value):
+    val = default_config_value
+    try:
+        value_from_config = config.get(CONFIG_SECTION, config_name)
+        try:
+            if int(value_from_config) > 0:
+                val = int(value_from_config)
+            else:
+                logging.debug(
+                    '%s value in config file "%s" is lower than 1. Defaulting to %d.',
+                    config_name,
+                    CONFIG_FILE,
+                    default_config_value,
+                )
+        except ValueError:
+            logging.debug(
+                'Bad %s, "%s", in config file "%s". Defaulting to %d.',
+                config_name,
+                value_from_config,
+                CONFIG_FILE,
+                default_config_value,
+            )
+    except NoOptionError:
+        logging.debug(
+            'No %s value in config file "%s". Defaulting to %d.',
+            config_name,
+            CONFIG_FILE,
+            default_config_value,
+        )
+
+    return val
 
 
 def usage(out, exit_code=1):
@@ -1831,8 +2082,7 @@ def check_and_create_private_key(base_path=STATE_FILE_DIR):
             os.write(f, lock_file_contents.encode("utf-8"))
             yield f
         finally:
-            os.close(f)
-            os.remove(lock_file)
+            check_and_remove_lock_file(lock_file, f)
 
     def do_with_lock(function):
         while True:
@@ -1847,7 +2097,15 @@ def check_and_create_private_key(base_path=STATE_FILE_DIR):
                     )
                     time.sleep(DEFAULT_TIMEOUT)
                 else:
-                    raise
+                    # errno.ENOENT: No such file or directory, errno.EBADF: Bad file descriptor
+                    if e.errno == errno.ENOENT or e.errno == errno.EBADF:
+                        logging.debug(
+                            "lock file does not exist or Bad file descriptor, The file is already removed nothing to do."
+                        )
+                    else:
+                        raise Exception(
+                            "Could not remove lock file unexpected exception: %s", e
+                        )
 
     def generate_key():
         if os.path.isfile(key):
@@ -2074,7 +2332,10 @@ def bootstrap_logging(config, log_dir=LOG_DIR):
         os.path.join(log_dir, LOG_FILE), maxBytes=max_bytes, backupCount=file_count
     )
     handler.setFormatter(
-        logging.Formatter(fmt="%(asctime)s - %(levelname)s - %(message)s")
+        logging.Formatter(
+            fmt="%(asctime)s - %(levelname)s - %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S %Z",
+        )
     )
 
     logger = logging.getLogger()
@@ -2219,6 +2480,24 @@ def check_if_fall_back_to_mount_target_ip_address_is_enabled(config):
         FALLBACK_TO_MOUNT_TARGET_IP_ADDRESS_ITEM,
         default_value=DEFAULT_FALLBACK_ENABLED,
     )
+
+
+def check_and_remove_lock_file(path, file):
+    """
+    There is a possibility of having a race condition as the lock file is getting deleted in both mount_efs and watchdog,
+    so creating a function in order to check whether the path exist or not before removing the lock file.
+    """
+    try:
+        os.close(file)
+        os.remove(path)
+        logging.debug("Removed %s successfully", path)
+    except OSError as e:
+        if not (e.errno == errno.ENOENT or e.errno == errno.EBADF):
+            raise Exception("Could not remove %s. Unexpected exception: %s", path, e)
+        else:
+            logging.debug(
+                "%s does not exist, The file is already removed nothing to do", path
+            )
 
 
 def dns_name_can_be_resolved(dns_name):
@@ -2681,11 +2960,16 @@ def check_options_validity(options):
             'The "iam" option is required when mounting with named profile option, "awsprofile"'
         )
 
-    if "awscredsuri" in options and "iam" not in options:
-        fatal_error('The "iam" option is required when mounting with "awscredsuri"')
-
-    if "awscredsuri" in options and "awsprofile" in options:
-        fatal_error('The "awscredsuri" and "awsprofile" options are mutually exclusive')
+    if "awscredsuri" in options:
+        if "iam" not in options:
+            fatal_error('The "iam" option is required when mounting with "awscredsuri"')
+        if "awsprofile" in options:
+            fatal_error(
+                'The "awscredsuri" and "awsprofile" options are mutually exclusive'
+            )
+        # The URI must start with slash symbol as it will be appended to the ECS task metadata endpoint
+        if not options["awscredsuri"].startswith("/"):
+            fatal_error("awscredsuri %s is malformed" % options["awscredsuri"])
 
 
 def bootstrap_cloudwatch_logging(config, options, fs_id=None):
@@ -2739,10 +3023,30 @@ def create_default_cloudwatchlog_agent_if_not_exist(config, options):
         CLOUDWATCHLOG_AGENT = bootstrap_cloudwatch_logging(config, options)
 
 
+def get_fips_config(config):
+    """
+    Check whether FIPS is enabled either by setting the `AWS_USE_FIPS_ENDPOINT`
+    environmental variable, or through the efs-utils config file.
+
+    Enabling FIPS means that both the Botocore client and stunnel will be configured
+    to use FIPS.
+    """
+
+    return os.getenv(
+        AWS_FIPS_ENDPOINT_CONFIG_ENV, "False"
+    ).lower() == "true" or get_boolean_config_item_value(
+        config, CONFIG_SECTION, "fips_mode_enabled", default_value=False
+    )
+
+
 def get_botocore_client(config, service, options):
     if not BOTOCORE_PRESENT:
         logging.error("Failed to import botocore, please install botocore first.")
         return None
+
+    botocore_config = None
+    if get_fips_config(config):
+        botocore_config = botocore.config.Config(use_fips_endpoint=True)
 
     session = botocore.session.get_session()
     region = get_target_region(config)
@@ -2751,14 +3055,16 @@ def get_botocore_client(config, service, options):
         profile = options.get("awsprofile")
         session.set_config_variable("profile", profile)
         try:
-            return session.create_client(service, region_name=region)
+            return session.create_client(
+                service, region_name=region, config=botocore_config
+            )
         except ProfileNotFound as e:
             fatal_error(
                 "%s, please add the [profile %s] section in the aws config file following %s and %s."
                 % (e, profile, NAMED_PROFILE_HELP_URL, CONFIG_FILE_SETTINGS_HELP_URL)
             )
 
-    return session.create_client(service, region_name=region)
+    return session.create_client(service, region_name=region, config=botocore_config)
 
 
 def get_cloudwatchlog_config(config, fs_id=None):
@@ -3327,25 +3633,43 @@ def optimize_readahead_window(mountpoint, options, config):
     fixed_readahead_kb = int(
         DEFAULT_NFS_MAX_READAHEAD_MULTIPLIER * int(options["rsize"]) / 1024
     )
+
     try:
-        # use "stat -c '%d' mountpoint" to get Device number in decimal
-        mountpoint_dev_num = subprocess.check_output(
-            ["stat", "-c", '"%d"', mountpoint], universal_newlines=True
+        major, minor = decode_device_number(os.stat(mountpoint).st_dev)
+        # modify read_ahead_kb in /sys/class/bdi/<bdi>/read_ahead_kb
+        # The bdi identifier is in the form of MAJOR:MINOR, which can be derived from device number
+        #
+        read_ahead_kb_config_file = NFS_READAHEAD_CONFIG_PATH_FORMAT % (major, minor)
+
+        logging.debug(
+            "Modifying value in %s to %s.",
+            read_ahead_kb_config_file,
+            str(fixed_readahead_kb),
         )
-        # modify read_ahead_kb in /sys/class/bdi/0:[Device Number]/read_ahead_kb
-        subprocess.check_call(
-            "echo %s > %s"
-            % (
-                fixed_readahead_kb,
-                NFS_READAHEAD_CONFIG_PATH_FORMAT
-                % mountpoint_dev_num.strip().strip('"'),
-            ),
+        p = subprocess.Popen(
+            "echo %s > %s" % (fixed_readahead_kb, read_ahead_kb_config_file),
             shell=True,
+            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
         )
-    except subprocess.CalledProcessError as e:
+        _, error = p.communicate()
+        if p.returncode != 0:
+            logging.warning(
+                'Failed to modify read_ahead_kb: %s with returncode: %d, error: "%s".'
+                % (fixed_readahead_kb, p.returncode, error.strip())
+            )
+    except Exception as e:
         logging.warning(
-            "failed to modify read_ahead_kb: %s with error %s" % (fixed_readahead_kb, e)
+            'Failed to modify read_ahead_kb: %s with error: "%s".'
+            % (fixed_readahead_kb, e)
         )
+
+
+# https://github.com/torvalds/linux/blob/master/include/linux/kdev_t.h#L48-L49
+def decode_device_number(device_number):
+    major = (device_number & 0xFFF00) >> 8
+    minor = (device_number & 0xFF) | ((device_number >> 12) & 0xFFF00)
+    return major, minor
 
 
 # Only modify read_ahead_kb iff
@@ -3399,7 +3723,9 @@ def main():
     bootstrap_logging(config)
 
     if check_if_platform_is_mac() and not check_if_mac_version_is_supported():
-        fatal_error("We do not support EFS on MacOS " + platform.release())
+        fatal_error(
+            "We do not support EFS on MacOS Kernel version " + platform.release()
+        )
 
     fs_id, path, mountpoint, options = parse_arguments(config)
 
