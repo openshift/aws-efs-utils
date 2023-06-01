@@ -1,7 +1,4 @@
 approvers:
-- jsafrane
-- tsmetana
-- gnufied
-- bertinatto
-- dobsonj
+- openshift-storage-maintainers
 component: "Storage"
+subcomponent: Kubernetes External Components
