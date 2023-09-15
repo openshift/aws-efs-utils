@@ -2,7 +2,7 @@ FROM registry.ci.openshift.org/ocp/4.14:base
 
 # install deps
 RUN yum update -y && \
-    yum install --setopt=tsflags=nodocs -y nfs-utils stunnel python3 openssl util-linux which && \
+    yum install --setopt=tsflags=nodocs -y nfs-utils stunnel python3 openssl util-linux which python3-botocore && \
     yum clean all && rm -rf /var/cache/yum/*
 
 # create log file
