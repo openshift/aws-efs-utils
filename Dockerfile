@@ -1,4 +1,4 @@
-FROM registry.ci.openshift.org/ocp/4.15:base
+FROM registry.ci.openshift.org/ocp/4.16:base
 
 # install deps
 RUN yum update -y && \
