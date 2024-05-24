@@ -253,7 +253,7 @@ class Version:
 
 class EFSUtilsVersionChecker:
     GITHUB_TIMEOUT_SEC = 0.300
-    VERSION_CHECK_POLL_INTERVAL_SEC = 3600
+    VERSION_CHECK_POLL_INTERVAL_SEC = 43,200
     VERSION_CHECK_FILE_KEY = "time"
     GITHUB_TAG_API_URL = "https://api.github.com/repos/aws/efs-utils/tags"
     SHOULD_CHECK_AMZN_REPOS = "Amazon Linux" in get_system_release_version()
