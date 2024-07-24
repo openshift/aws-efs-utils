@@ -13,8 +13,9 @@ The `efs-utils` package has been verified against the following Linux distributi
 | Amazon Linux 2023    | `rpm` | `systemd` |
 | CentOS 7             | `rpm` | `systemd` |
 | CentOS 8             | `rpm` | `systemd` |
-| RHEL 7               | `rpm`| `systemd` |
-| RHEL 8               | `rpm`| `systemd` |
+| RHEL 7               | `rpm` | `systemd` |
+| RHEL 8               | `rpm` | `systemd` |
+| RHEL 9               | `rpm` | `systemd` |
 | Fedora 28            | `rpm` | `systemd` |
 | Fedora 29            | `rpm` | `systemd` |
 | Fedora 30            | `rpm` | `systemd` |
@@ -34,10 +35,11 @@ The `efs-utils` package has been verified against the following Linux distributi
 The `efs-utils` package has been verified against the following MacOS distributions:
 
 | Distribution   | `init` System |
-| -------------- | ------------- |
-| MacOS Big Sur  | `launchd` |
-| MacOS Monterey | `launchd` |
-| MacOS Ventura  | `launchd` |
+|----------------|---------------|
+| MacOS Big Sur  | `launchd`     |
+| MacOS Monterey | `launchd`     |
+| MacOS Ventura  | `launchd`     |
+| MacOS Sonoma   | `launchd`     |
 
 ## README contents
   - [Prerequisites](#prerequisites)
@@ -73,7 +75,6 @@ The `efs-utils` package has been verified against the following MacOS distributi
   - [The way to access instance metadata](#the-way-to-access-instance-metadata)
   - [Use the assumed profile credentials for IAM](#use-the-assumed-profile-credentials-for-iam)
   - [Enabling FIPS Mode](#enabling-fips-mode)
-  - [Disabling Version Check](#disabling-version-check)
   - [License Summary](#license-summary)
 
 
@@ -158,11 +159,11 @@ $ ./build-deb.sh
 $ sudo apt-get -y install ./build/amazon-efs-utils*deb
 ```
 
-### On MacOS Big Sur, macOS Monterey and macOS Ventura distribution
+### On MacOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura distribution
 
-For EC2 Mac instances running macOS Big Sur, macOS Monterey and macOS Ventura, you can install amazon-efs-utils from the 
+For EC2 Mac instances running macOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura, you can install amazon-efs-utils from the 
 [homebrew-aws](https://github.com/aws/homebrew-aws) respository. **Note that this will ONLY work on EC2 instances
-running macOS Big Sur, macOS Monterey and macOS Ventura, not local Mac computers.**
+running macOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura, not local Mac computers.**
 ```bash
 brew install amazon-efs-utils
 ```
@@ -220,6 +221,13 @@ To mount file system to the mount target in specific availability zone (e.g. us-
 $ sudo mount -t efs -o az=az-name file-system-id efs-mount-point/
 ```
 
+**Note: The [prequisites in the crossaccount section below](#crossaccount-option-prerequisites) must be completed before using the crossaccount option.**
+
+To mount the filesystem mount target in the same physical availability zone ID (e.g. use1-az1) as the client instance over cross-AWS-account mounts, run:
+```
+$ sudo mount -t efs -o crossaccount file-system-id efs-mount-point/
+```
+
 To mount over TLS, simply add the `tls` option:
 
 ```bash
@@ -252,6 +260,28 @@ man mount.efs
 ```
 
 or refer to the [documentation](https://docs.aws.amazon.com/efs/latest/ug/using-amazon-efs-utils.html).
+
+#### crossaccount Option Prerequisites
+
+The crossaccount mount option ensures that the client instance Availability Zone ID (e.g. use1-az1) is the same as the EFS mount target Availability Zone ID for cross-AWS-account mounts (e.g. if the client instance is in Account A while the EFS instance is in Account B). 
+
+Given a client instance in Account A/VPC A and an EFS instance in Account B/VPC B, the following prerequisites must be completed prior to using the crossaccount option:
+- Cross-VPC Communication:
+  - Create a VPC Peering relationship between VPC A & VPC B. Documentation to create the peering relationship can be found [here](https://docs.aws.amazon.com/vpc/latest/peering/create-vpc-peering-connection.html).
+  - Configure VPC route tables to send/receive traffic. Documentation can be found [here](https://docs.aws.amazon.com/vpc/latest/peering/vpc-peering-routing.html).
+  - Create subnet in VPC B in the Availability Zone of the Account A client instance if it does not exist already.
+  - Create an EFS Mount Target in each of the Availability Zones from the above step in VPC B if they do not exist already.
+  - Attach a VPC Security Group to each of the EFS Mount Targets which allow inbound NFS access from VPC A’s CIDR block.
+- Route 53 Setup:
+  - For a mount target A in <availability-zone-id>, create a Route 53 Hosted Zone for the domain <availability-zone-id>.<file-system-id>.efs.<aws-region>.amazonaws.com.
+  - Then, add an A record in the Hosted Zone which resolves to mount target A's IP Address. Leave the subdomain blank.
+
+
+Once the above steps have been completed, to mount the filesystem mount target in the same physical availability zone ID (e.g. use1-az1) as the client instance over cross-AWS-account mounts, run:
+```
+$ sudo mount -t efs -o crossaccount file-system-id efs-mount-point/
+```
+
 
 ### MacOS 
 
@@ -559,18 +589,6 @@ Threading:PTHREAD Sockets:POLL,IPv6 SSL:ENGINE,OCSP,FIPS Auth:LIBWRAP
 ```
 
 For more information on how to configure OpenSSL with FIPS see the [OpenSSL FIPS README](https://github.com/openssl/openssl/blob/master/README-FIPS.md).
-
-## Disabling Version Check
-By default, once an hour, the watchdog daemon service will check to see if a newer version of amazon-efs-utils is available on github or yum.
-You can disable this check by setting the `enable_version_check` field in `/etc/amazon/efs/efs-utils.conf` to `false`. For example, 
-```bash
-sudo sed -i 's/enable_version_check = true/enable_version_check = false/' /etc/amazon/efs/efs-utils.conf
-```  
-Or on MacOS:  
-```bash
-VERSION=<efs-utils version, e.g. 1.34.1>
-sudo sed -i 's/enable_version_check = true/enable_version_check = false/' /usr/local/Cellar/amazon-efs-utils/${VERSION}/libexec/etc/amazon/efs/efs-utils.conf
-```
 
 ## License Summary
 
