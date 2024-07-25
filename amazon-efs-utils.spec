@@ -35,7 +35,7 @@
 %endif
 
 Name      : amazon-efs-utils
-Version   : 1.35.1
+Version   : 1.36.0
 Release   : 1%{platform}
 Summary   : This package provides utilities for simplifying the use of EFS file systems
 
@@ -138,6 +138,13 @@ fi
 %clean
 
 %changelog
+* Mon Mar 18 2024 Sean Zatz <zatzsea@amazon.com> - 1.36.0
+- Support new mount option: crossaccount, conduct cross account mounts via ip address. Use client AZ-ID to choose mount target.
+
+* Fri Feb 09 2024 Rakesh Yelisetty <rakeshye@amazon.com> - 1.35.2
+- Revert "Add warning if using older Version"
+- Support MacOS Sonoma
+
 * Wed Jan 10 2024 Sean Zatz <zatsea@amazon.com> - 1.35.1
 - Add 'fsap' to ignored mount option list
 - Accept openssl 3.0 in rpm spec file

@@ -56,14 +56,13 @@ AMAZON_LINUX_2_RELEASE_VERSIONS = [
     AMAZON_LINUX_2_RELEASE_ID,
     AMAZON_LINUX_2_PRETTY_NAME,
 ]
-VERSION = "1.35.1"
+VERSION = "1.36.0"
 SERVICE = "elasticfilesystem"
 
 CONFIG_FILE = "/etc/amazon/efs/efs-utils.conf"
 CONFIG_SECTION = "mount-watchdog"
 MOUNT_CONFIG_SECTION = "mount"
 CLIENT_INFO_SECTION = "client-info"
-ENABLE_VERSION_CHECK = "enable_version_check"
 CLIENT_SOURCE_STR_LEN_LIMIT = 100
 DISABLE_FETCH_EC2_METADATA_TOKEN_ITEM = "disable_fetch_ec2_metadata_token"
 DEFAULT_UNKNOWN_VALUE = "unknown"
@@ -76,7 +75,6 @@ LOG_FILE = "mount-watchdog.log"
 
 STATE_FILE_DIR = "/var/run/efs"
 STUNNEL_PID_FILE = "stunnel.pid"
-LAST_VERSION_CHECK_FILE = "last_version_check.json"
 
 DEFAULT_NFS_PORT = "2049"
 PRIVATE_KEY_FILE = "/etc/amazon/efs/privateKey.pem"
@@ -182,7 +180,6 @@ MAC_OS_PLATFORM_LIST = ["darwin"]
 SYSTEM_RELEASE_PATH = "/etc/system-release"
 OS_RELEASE_PATH = "/etc/os-release"
 STUNNEL_INSTALLATION_MESSAGE = "Please install it following the instructions at: https://docs.aws.amazon.com/efs/latest/ug/using-amazon-efs-utils.html#upgrading-stunnel"
-
 
 def check_if_platform_is_mac():
     return sys.platform in MAC_OS_PLATFORM_LIST
@@ -431,7 +428,6 @@ class EFSUtilsVersionChecker:
             config, CONFIG_SECTION, ENABLE_VERSION_CHECK, default_value=True
         )
         return version_check_enabled and EFSUtilsVersionChecker.version_check_ready()
-
 
 def fatal_error(user_message, log_message=None):
     if log_message is None:
@@ -1117,6 +1113,32 @@ def is_pid_running(pid):
         return True
     except OSError:
         return False
+
+
+def check_if_platform_is_mac():
+    return sys.platform in MAC_OS_PLATFORM_LIST
+
+
+def get_system_release_version():
+    # MacOS does not maintain paths /etc/os-release and /etc/sys-release
+    if check_if_platform_is_mac():
+        return platform.platform()
+
+    try:
+        with open(SYSTEM_RELEASE_PATH) as f:
+            return f.read().strip()
+    except IOError:
+        logging.debug("Unable to read %s", SYSTEM_RELEASE_PATH)
+
+    try:
+        with open(OS_RELEASE_PATH) as f:
+            for line in f:
+                if "PRETTY_NAME" in line:
+                    return line.split("=")[1].strip()
+    except IOError:
+        logging.debug("Unable to read %s", OS_RELEASE_PATH)
+
+    return DEFAULT_UNKNOWN_VALUE
 
 
 def find_command_path(command, install_method):
@@ -2377,9 +2399,6 @@ def main():
                 unmount_count_for_consistency,
             )
             check_child_procs(child_procs)
-
-            if EFSUtilsVersionChecker.should_check_efs_utils_version(config):
-                EFSUtilsVersionChecker.check_if_using_old_version(VERSION)
 
             time.sleep(poll_interval_sec)
     else:
