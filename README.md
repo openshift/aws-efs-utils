@@ -34,10 +34,11 @@ The `efs-utils` package has been verified against the following Linux distributi
 The `efs-utils` package has been verified against the following MacOS distributions:
 
 | Distribution   | `init` System |
-| -------------- | ------------- |
-| MacOS Big Sur  | `launchd` |
-| MacOS Monterey | `launchd` |
-| MacOS Ventura  | `launchd` |
+|----------------|---------------|
+| MacOS Big Sur  | `launchd`     |
+| MacOS Monterey | `launchd`     |
+| MacOS Ventura  | `launchd`     |
+| MacOS Sonoma   | `launchd`     |
 
 ## README contents
   - [Prerequisites](#prerequisites)
@@ -73,7 +74,6 @@ The `efs-utils` package has been verified against the following MacOS distributi
   - [The way to access instance metadata](#the-way-to-access-instance-metadata)
   - [Use the assumed profile credentials for IAM](#use-the-assumed-profile-credentials-for-iam)
   - [Enabling FIPS Mode](#enabling-fips-mode)
-  - [Disabling Version Check](#disabling-version-check)
   - [License Summary](#license-summary)
 
 
@@ -158,11 +158,11 @@ $ ./build-deb.sh
 $ sudo apt-get -y install ./build/amazon-efs-utils*deb
 ```
 
-### On MacOS Big Sur, macOS Monterey and macOS Ventura distribution
+### On MacOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura distribution
 
-For EC2 Mac instances running macOS Big Sur, macOS Monterey and macOS Ventura, you can install amazon-efs-utils from the 
+For EC2 Mac instances running macOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura, you can install amazon-efs-utils from the 
 [homebrew-aws](https://github.com/aws/homebrew-aws) respository. **Note that this will ONLY work on EC2 instances
-running macOS Big Sur, macOS Monterey and macOS Ventura, not local Mac computers.**
+running macOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura, not local Mac computers.**
 ```bash
 brew install amazon-efs-utils
 ```
@@ -559,18 +559,6 @@ Threading:PTHREAD Sockets:POLL,IPv6 SSL:ENGINE,OCSP,FIPS Auth:LIBWRAP
 ```
 
 For more information on how to configure OpenSSL with FIPS see the [OpenSSL FIPS README](https://github.com/openssl/openssl/blob/master/README-FIPS.md).
-
-## Disabling Version Check
-By default, once an hour, the watchdog daemon service will check to see if a newer version of amazon-efs-utils is available on github or yum.
-You can disable this check by setting the `enable_version_check` field in `/etc/amazon/efs/efs-utils.conf` to `false`. For example, 
-```bash
-sudo sed -i 's/enable_version_check = true/enable_version_check = false/' /etc/amazon/efs/efs-utils.conf
-```  
-Or on MacOS:  
-```bash
-VERSION=<efs-utils version, e.g. 1.34.1>
-sudo sed -i 's/enable_version_check = true/enable_version_check = false/' /usr/local/Cellar/amazon-efs-utils/${VERSION}/libexec/etc/amazon/efs/efs-utils.conf
-```
 
 ## License Summary
 
