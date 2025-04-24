@@ -2,7 +2,7 @@ FROM registry.ci.openshift.org/ocp/4.19:base-rhel9
 
 # install deps
 RUN yum update -y && \
-    yum install --setopt=tsflags=nodocs -y nfs-utils stunnel python3 openssl util-linux which && \
+    yum install --setopt=tsflags=nodocs -y nfs-utils stunnel python3 openssl util-linux which python3-pip python3-jmespath && \
     yum clean all && rm -rf /var/cache/yum/*
 
 # create log file
@@ -18,3 +18,6 @@ COPY ./src/mount_efs/__init__.py /sbin/mount.efs
 RUN chmod 755 /sbin/mount.efs
 COPY ./src/watchdog/__init__.py /usr/bin/amazon-efs-mount-watchdog
 RUN chmod 755 /usr/bin/amazon-efs-mount-watchdog
+
+COPY venv /home/venv
+RUN pip install --no-index /home/venv/botocore-1.34.140-py3-none-any.whl
