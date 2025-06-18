@@ -25,7 +25,7 @@ import sys
 import time
 from collections import namedtuple
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from signal import SIGHUP, SIGKILL, SIGTERM
 
@@ -56,7 +56,7 @@ AMAZON_LINUX_2_RELEASE_VERSIONS = [
     AMAZON_LINUX_2_RELEASE_ID,
     AMAZON_LINUX_2_PRETTY_NAME,
 ]
-VERSION = "1.36.0"
+VERSION = "2.2.1"
 SERVICE = "elasticfilesystem"
 
 CONFIG_FILE = "/etc/amazon/efs/efs-utils.conf"
@@ -146,7 +146,7 @@ REQUEST_PAYLOAD = ""
 AP_ID_RE = re.compile("^fsap-[0-9a-f]{17}$")
 
 ECS_TASK_METADATA_API = "http://169.254.170.2"
-STS_ENDPOINT_URL_FORMAT = "https://sts.{}.amazonaws.com/"
+STS_ENDPOINT_URL_FORMAT = "https://sts.{}.{}/"
 INSTANCE_IAM_URL = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
 INSTANCE_METADATA_TOKEN_URL = "http://169.254.169.254/latest/api/token"
 SECURITY_CREDS_ECS_URI_HELP_URL = (
@@ -180,6 +180,9 @@ MAC_OS_PLATFORM_LIST = ["darwin"]
 SYSTEM_RELEASE_PATH = "/etc/system-release"
 OS_RELEASE_PATH = "/etc/os-release"
 STUNNEL_INSTALLATION_MESSAGE = "Please install it following the instructions at: https://docs.aws.amazon.com/efs/latest/ug/using-amazon-efs-utils.html#upgrading-stunnel"
+EFS_PROXY_INSTALLATION_MESSAGE = "Please install it by reinstalling amazon-efs-utils"
+
+EFS_PROXY_BIN = "efs-proxy"
 
 
 def fatal_error(user_message, log_message=None):
@@ -381,9 +384,9 @@ def get_aws_security_credentials_from_webidentity(config, role_arn, token_file, 
         logging.error("Error reading token file %s: %s", token_file, e)
         return None
 
-    STS_ENDPOINT_URL = STS_ENDPOINT_URL_FORMAT.format(region)
+    sts_endpoint_url = get_sts_endpoint_url(config, region)
     webidentity_url = (
-        STS_ENDPOINT_URL
+        sts_endpoint_url
         + "?"
         + urlencode(
             {
@@ -397,11 +400,11 @@ def get_aws_security_credentials_from_webidentity(config, role_arn, token_file, 
     )
 
     unsuccessful_resp = (
-        "Unsuccessful retrieval of AWS security credentials at %s." % STS_ENDPOINT_URL
+        "Unsuccessful retrieval of AWS security credentials at %s." % sts_endpoint_url
     )
     url_error_msg = (
         "Unable to reach %s to retrieve AWS security credentials. See %s for more info."
-        % (STS_ENDPOINT_URL, SECURITY_CREDS_WEBIDENTITY_HELP_URL)
+        % (sts_endpoint_url, SECURITY_CREDS_WEBIDENTITY_HELP_URL)
     )
     resp = url_request_helper(
         config,
@@ -425,6 +428,39 @@ def get_aws_security_credentials_from_webidentity(config, role_arn, token_file, 
             }
 
     return None
+
+
+def get_sts_endpoint_url(config, region):
+    dns_name_suffix = get_dns_name_suffix(config, region)
+    return STS_ENDPOINT_URL_FORMAT.format(region, dns_name_suffix)
+
+
+def get_dns_name_suffix(config, region):
+    return get_mount_config(config, region, "dns_name_suffix")
+
+
+def get_mount_config(config, region, config_name):
+    try:
+        config_section = get_mount_config_section(config, region)
+        return config.get(config_section, config_name)
+    except NoOptionError:
+        pass
+
+    try:
+        return config.get(MOUNT_CONFIG_SECTION, config_name)
+    except NoOptionError:
+        fatal_error(
+            "Error retrieving config. Please set the {} configuration in efs-utils.conf".format(config_name)
+        )
+
+
+def get_mount_config_section(config, region):
+    region_specific_config_section = "%s.%s" % (MOUNT_CONFIG_SECTION, region)
+    if config.has_section(region_specific_config_section):
+        config_section = region_specific_config_section
+    else:
+        config_section = MOUNT_CONFIG_SECTION
+    return config_section
 
 
 def get_aws_security_credentials_from_instance_metadata(config):
@@ -798,9 +834,10 @@ def get_pid_in_state_dir(state_file, state_file_dir):
 
 def is_mount_stunnel_proc_running(state_pid, state_file, state_file_dir):
     """
-    Check whether a given stunnel process id in state file is running for the mount. To avoid we incorrectly checking
-    processes running by other applications and send signal further, the stunnel process in state file is counted as
-    running iff:
+    Check whether the PID in the state file corresponds to a running efs-proxy/stunnel process.
+    Although this code was originally written to check if stunnel is running, we've modified
+    it to support the efs-proxy process as well.
+    The proxy or stunnel process is counted as running iff:
     1. The pid in state file is not None.
     2. The process running with the pid is a stunnel process. This is validated through process command name.
     3. The process can be reached via os.kill(pid, 0).
@@ -818,9 +855,11 @@ def is_mount_stunnel_proc_running(state_pid, state_file, state_file_dir):
         return False
 
     process_name = check_process_name(state_pid)
-    if not process_name or "stunnel" not in str(process_name):
+    if not process_name or (
+        "efs-proxy" not in str(process_name) and "stunnel" not in str(process_name)
+    ):
         logging.debug(
-            "Process running on %s is not a stunnel process, full command: %s.",
+            "Process running on %s is not an efs-proxy or stunnel process, full command: %s.",
             state_pid,
             str(process_name) if process_name else "",
         )
@@ -828,7 +867,7 @@ def is_mount_stunnel_proc_running(state_pid, state_file, state_file_dir):
 
     if not is_pid_running(state_pid):
         logging.debug(
-            "Stunnel process with pid %s is not running anymore for %s.",
+            "Stunnel or efs-proxy process with pid %s is not running anymore for %s.",
             state_pid,
             state_file,
         )
@@ -942,10 +981,38 @@ def update_stunnel_command_for_ecs_amazon_linux_2(
     return command
 
 
+def command_uses_efs_proxy(command):
+    """
+    Accepts a list of strings which represents the command that was used
+    to start or efs-proxy. If the command contains efs-proxy, return True.
+
+    Since we control the filepath in which the efs-proxy executable is stored, we
+    know that we will not run into situations where a directory on the filepath is named
+    efs-proxy but the executable command is something else, like stunnel.
+    """
+    for i in range(len(command)):
+        if EFS_PROXY_BIN in command[i]:
+            return True
+
+    return False
+
+
 def start_tls_tunnel(child_procs, state, state_file_dir, state_file):
-    # launch the tunnel in a process group so if it has any child processes, they can be killed easily
+    """
+    Reads the command from the state file, and uses it to start a subprocess.
+    This is the command that efs-utils used to spin up the efs-proxy or stunnel process.
+
+    We launch the stunnel and efs-proxy process in a process group so that child processes can be easily killed.
+    :param child_procs: list that contains efs-proxy / stunnel processes that the Watchdog instance has spawned
+    :param state: the state corresponding to a given mount - the proxy process associated with this mount will be started
+    :param state_file_dir: the directory where mount state files are stored
+    :param state_file: this function may rewrite the command used to start up the proxy or stunnel process, and thus needs a handle on the state file to update it.
+    :return: the pid of the proxy or stunnel process that was spawned
+    """
     command = state["cmd"]
     logging.info('Starting TLS tunnel: "%s"', " ".join(command))
+
+    efs_proxy_enabled = command_uses_efs_proxy(command)
 
     command = update_stunnel_command_for_ecs_amazon_linux_2(
         command, state, state_file_dir, state_file
@@ -960,44 +1027,57 @@ def start_tls_tunnel(child_procs, state, state_file_dir, state_file):
             close_fds=True,
         )
     except FileNotFoundError as e:
-        logging.warning("Watchdog failed to start stunnel due to %s", e)
+        if efs_proxy_enabled:
+            logging.warning("Watchdog failed to start efs-proxy due to %s", e)
+        else:
+            logging.warning("Watchdog failed to start stunnel due to %s", e)
 
-        # https://github.com/kubernetes-sigs/aws-efs-csi-driver/issues/812 It is possible that the stunnel is not
-        # present anymore and replaced by stunnel5 on AL2, meanwhile watchdog is attempting to restart stunnel for
-        # mount using old efs-utils based on old state file generated during previous mount, which has stale command
-        # using stunnel bin. Update the state file if the stunnel does not exist anymore, and use stunnel5 on Al2.
-        #
-        if get_system_release_version() in AMAZON_LINUX_2_RELEASE_VERSIONS:
-            for i in range(len(command)):
-                if "stunnel" in command[i] and "stunnel-config" not in command[i]:
-                    command[i] = find_command_path(
-                        "stunnel5", STUNNEL_INSTALLATION_MESSAGE
-                    )
-                    break
+            # https://github.com/kubernetes-sigs/aws-efs-csi-driver/issues/812 It is possible that the stunnel is not
+            # present anymore and replaced by stunnel5 on AL2, meanwhile watchdog is attempting to restart stunnel for
+            # mount using old efs-utils based on old state file generated during previous mount, which has stale command
+            # using stunnel bin. Update the state file if the stunnel does not exist anymore, and use stunnel5 on Al2.
+            #
+            if get_system_release_version() in AMAZON_LINUX_2_RELEASE_VERSIONS:
+                for i in range(len(command)):
+                    if "stunnel" in command[i] and "stunnel-config" not in command[i]:
+                        command[i] = find_command_path(
+                            "stunnel5", STUNNEL_INSTALLATION_MESSAGE
+                        )
+                        break
 
-            tunnel = subprocess.Popen(
-                command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=os.setsid,
-                close_fds=True,
-            )
+                tunnel = subprocess.Popen(
+                    command,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    preexec_fn=os.setsid,
+                    close_fds=True,
+                )
 
-            state["cmd"] = command
-            logging.info(
-                "Rewriting %s with new stunnel cmd: %s for Amazon Linux 2 platform.",
-                state_file,
-                " ".join(state["cmd"]),
-            )
-            rewrite_state_file(state, state_file_dir, state_file)
+                state["cmd"] = command
+                logging.info(
+                    "Rewriting %s with new stunnel cmd: %s for Amazon Linux 2 platform.",
+                    state_file,
+                    " ".join(state["cmd"]),
+                )
+                rewrite_state_file(state, state_file_dir, state_file)
+
+    # We may have used either stunnel or efs-proxy as the TLS tunnel.
+    # We want to make it clear in the logs which was used.
+    tunnel_process_name = "stunnel"
+    if efs_proxy_enabled:
+        tunnel_process_name = "efs-proxy"
 
     if tunnel is None or not is_pid_running(tunnel.pid):
         fatal_error(
-            "Failed to initialize TLS tunnel for %s" % state_file,
-            "Failed to start TLS tunnel.",
+            "Failed to initialize %s for %s" % (tunnel_process_name, state_file),
+            "Failed to start %s." % tunnel_process_name,
+        )
+        fatal_error(
+            "Failed to initialize %s for %s" % (tunnel_process_name, state_file),
+            "Failed to start %s." % tunnel_process_name,
         )
 
-    logging.info("Started TLS tunnel, pid: %d", tunnel.pid)
+    logging.info("Started %s, pid: %d", tunnel_process_name, tunnel.pid)
 
     child_procs.append(tunnel)
     return tunnel.pid
@@ -1148,18 +1228,6 @@ def check_efs_mounts(
             if is_mount_stunnel_proc_running(
                 state.get("pid"), state_file, state_file_dir
             ):
-                # https://github.com/kubernetes-sigs/aws-efs-csi-driver/issues/616 We have seen EFS hanging issue caused
-                # by stuck stunnel (version: 4.56) process. Apart from checking whether stunnel is running or not, we
-                # need to check whether the stunnel connection established is healthy periodically.
-                #
-                # The way to check the stunnel health is by `df` the mountpoint, i.e. check the file system information,
-                # which will trigger a remote GETATTR on the root of the file system. Normally the command will finish
-                # in 10 milliseconds, thus if the command hang for certain period (defined as 30 sec as of now), the
-                # stunnel connection is likely to be unhealthy. Watchdog will kill the old stunnel process and restart
-                # a new one for the unhealthy mount. The health check will run every 5 min since mount.
-                #
-                # Both the command hang timeout and health check interval are configurable in efs-utils config file.
-                #
                 check_stunnel_health(
                     config, state, state_file_dir, state_file, child_procs, nfs_mounts
                 )
@@ -1171,6 +1239,21 @@ def check_efs_mounts(
 def check_stunnel_health(
     config, state, state_file_dir, state_file, child_procs, nfs_mounts
 ):
+    """
+    Check the health of efs-proxy, or stunnel (older versions of efs-utils), by executing `df` on the mountpoint.
+
+    https://github.com/kubernetes-sigs/aws-efs-csi-driver/issues/616 We have seen EFS hanging issue caused
+    by stuck stunnel (version: 4.56) process. Apart from checking whether stunnel is running or not, we
+    need to check whether the stunnel connection established is healthy periodically.
+
+    The way to check the stunnel health is by `df` the mountpoint, i.e. check the file system information,
+    which will trigger a remote GETATTR on the root of the file system. Normally the command will finish
+    in 10 milliseconds, thus if the command hang for certain period (defined as 30 sec as of now), the
+    stunnel connection is likely to be unhealthy. Watchdog will kill the old stunnel process and restart
+    a new one for the unhealthy mount. The health check will run every 5 min since mount.
+
+    Both the command hang timeout and health check interval are configurable in efs-utils config file.
+    """
     if not get_boolean_config_item_value(
         config, CONFIG_SECTION, "stunnel_health_check_enabled", default_value=True
     ):
@@ -1358,7 +1441,7 @@ def check_certificate(
     )
     # creation instead of NOT_BEFORE datetime is used for refresh of cert because NOT_BEFORE derives from creation datetime
     should_refresh_cert = (
-        get_utc_now() - certificate_creation_time
+        get_utc_now() - certificate_creation_time.replace(tzinfo=timezone.utc)
     ).total_seconds() > certificate_renewal_interval_secs
 
     if certificate_exists and not should_refresh_cert:
@@ -2010,7 +2093,7 @@ def get_utc_now():
     """
     Wrapped for patching purposes in unit tests
     """
-    return datetime.utcnow()
+    return datetime.now(timezone.utc)
 
 
 def check_process_name(pid):
@@ -2069,11 +2152,11 @@ def clean_up_certificate_lock_file(state_file_dir=STATE_FILE_DIR):
     check_and_remove_file(lock_file)
 
 
-def clean_up_previous_stunnel_pids(state_file_dir=STATE_FILE_DIR):
+def clean_up_previous_tunnel_pids(state_file_dir=STATE_FILE_DIR):
     """
-    Cleans up stunnel pids created by mount watchdog spawned by a previous efs-csi-driver pod after driver restart, upgrade
-    or crash. This method attempts to clean PIDs from persisted state files after efs-csi-driver restart to
-    ensure watchdog creates a new stunnel.
+    Cleans up efs-proxy/stunnel pids created by mount watchdog spawned by a previous efs-csi-driver
+    pod after driver restart, upgrade, or crash. This method attempts to clean PIDs from persisted
+    state files after efs-csi-driver restart to ensure watchdog creates a new tunnel.
     """
     state_files = get_state_files(state_file_dir)
     logging.debug(
@@ -2097,7 +2180,7 @@ def clean_up_previous_stunnel_pids(state_file_dir=STATE_FILE_DIR):
 
             out = check_process_name(pid)
 
-            if out and "stunnel" in str(out):
+            if out and ("stunnel" in str(out) or "efs-proxy" in str(out)):
                 logging.debug(
                     "PID %s in state file %s is active. Skipping clean up",
                     pid,
@@ -2139,7 +2222,7 @@ def main():
             CONFIG_SECTION, "unmount_grace_period_sec"
         )
 
-        clean_up_previous_stunnel_pids()
+        clean_up_previous_tunnel_pids()
         clean_up_certificate_lock_file()
 
         while True:

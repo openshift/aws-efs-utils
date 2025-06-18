@@ -11,9 +11,11 @@ set -ex
 
 BASE_DIR=$(pwd)
 BUILD_ROOT=${BASE_DIR}/build/debbuild
-VERSION=1.36.0
+VERSION=2.2.1
 RELEASE=1
+ARCH=$(dpkg --print-architecture)
 DEB_SYSTEM_RELEASE_PATH=/etc/os-release
+export VERSION RELEASE ARCH
 
 echo 'Cleaning deb build workspace'
 rm -rf ${BUILD_ROOT}
@@ -28,12 +30,18 @@ mkdir -p ${BUILD_ROOT}/usr/bin
 mkdir -p ${BUILD_ROOT}/var/log/amazon/efs
 mkdir -p ${BUILD_ROOT}/usr/share/man/man8
 
+echo 'Building efs-proxy'
+cd src/proxy
+cargo build --release --manifest-path ${BASE_DIR}/src/proxy/Cargo.toml
+cd ${BASE_DIR}
+
 echo 'Copying application files'
 install -p -m 644 dist/amazon-efs-mount-watchdog.conf ${BUILD_ROOT}/etc/init
 install -p -m 644 dist/amazon-efs-mount-watchdog.service ${BUILD_ROOT}/etc/systemd/system
 install -p -m 444 dist/efs-utils.crt ${BUILD_ROOT}/etc/amazon/efs
 install -p -m 644 dist/efs-utils.conf ${BUILD_ROOT}/etc/amazon/efs
 install -p -m 755 src/mount_efs/__init__.py ${BUILD_ROOT}/sbin/mount.efs
+install -p -m 755 src/proxy/target/release/efs-proxy ${BUILD_ROOT}/usr/bin/efs-proxy
 install -p -m 755 src/watchdog/__init__.py ${BUILD_ROOT}/usr/bin/amazon-efs-mount-watchdog
 
 echo 'Copying install scripts'
@@ -41,8 +49,9 @@ install -p -m 755 dist/scriptlets/after-install-upgrade ${BUILD_ROOT}/postinst
 install -p -m 755 dist/scriptlets/before-remove ${BUILD_ROOT}/prerm
 install -p -m 755 dist/scriptlets/after-remove ${BUILD_ROOT}/postrm
 
-echo 'Copying control file'
-install -p -m 644 dist/amazon-efs-utils.control ${BUILD_ROOT}/control
+echo 'Generating control file'
+envsubst < dist/amazon-efs-utils.control > ${BUILD_ROOT}/control
+chmod 644 ${BUILD_ROOT}/control
 
 echo 'Copying conffiles'
 install -p -m 644 dist/amazon-efs-utils.conffiles ${BUILD_ROOT}/conffiles
@@ -63,7 +72,7 @@ tar czf data.tar.gz etc sbin usr var --owner=0 --group=0
 cd ${BASE_DIR}
 
 echo 'Building deb'
-DEB=${BUILD_ROOT}/amazon-efs-utils-${VERSION}-${RELEASE}_all.deb
+DEB=${BUILD_ROOT}/amazon-efs-utils-${VERSION}-${RELEASE}_${ARCH}.deb
 ar r ${DEB} ${BUILD_ROOT}/debian-binary
 ar r ${DEB} ${BUILD_ROOT}/control.tar.gz
 ar r ${DEB} ${BUILD_ROOT}/data.tar.gz
