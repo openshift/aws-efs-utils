@@ -1,0 +1,50 @@
+# OpenShift carry: requrements.txt tailored for OpenShift image build.
+
+# WARNING: to keep nr. of deps small, we remove most of unit-test dependencies!
+# `make test` won't work in the image build env.
+
+# All versions except botocore are set to the versions that are available in RHEL.
+
+attrs==20.3.0
+
+# botocore is not in RHEL9, download it from the internet (for local development) / cache (for real image builds).
+# botocore version in requirements.txt is too old (= requires too old urllib3 and docutils that are not in RHEL).
+# Using v1.34.140 from efs-utils-2.3.0 as a recent enough one that's fine with RHEL packages
+# and is at least used in some botocore release. Still, the version is quite arbitrary.
+botocore==1.34.140
+
+# RHEL Python 3.9 already has ConfigParser
+# configparser==3.5.0
+
+# coverage is not in RHEL and it's used only in tests.
+# coverage==4.5.4
+
+# RHEL Python 3.9 already supports enums
+# enum34==1.1.6
+
+# Used only for tests
+# flake8==3.7.9
+
+# Python 3.9 already support funcsig
+# funcsigs==1.0.2
+
+# Looks unused and is not in RHEL:
+# mccabe==0.6.1
+
+# Used only in tests:
+# mock==2.0.0
+# pbr==3.1.1
+# pluggy==0.13.0
+
+py==1.10.0
+
+# Used only in tests
+# pycodestyle==2.5.0
+# pyflakes==2.1.1
+# pytest==4.6.7
+# pytest-cov==2.8.1
+# pytest-html==1.19.0
+# pytest-metadata==1.7.0
+# pytest-mock==1.11.2
+
+six==1.15.0
