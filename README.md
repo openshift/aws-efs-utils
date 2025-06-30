@@ -8,24 +8,20 @@ The `efs-utils` package has been verified against the following Linux distributi
 
 | Distribution         | Package Type | `init` System |
 |----------------------| ----- | --------- |
-| Amazon Linux 2017.09 | `rpm` | `upstart` |
 | Amazon Linux 2       | `rpm` | `systemd` |
 | Amazon Linux 2023    | `rpm` | `systemd` |
-| CentOS 7             | `rpm` | `systemd` |
 | CentOS 8             | `rpm` | `systemd` |
-| RHEL 7               | `rpm` | `systemd` |
 | RHEL 8               | `rpm` | `systemd` |
 | RHEL 9               | `rpm` | `systemd` |
-| Fedora 28            | `rpm` | `systemd` |
 | Fedora 29            | `rpm` | `systemd` |
 | Fedora 30            | `rpm` | `systemd` |
 | Fedora 31            | `rpm` | `systemd` |
 | Fedora 32            | `rpm` | `systemd` |
-| Debian 9             | `deb` | `systemd` |
-| Debian 10            | `deb` | `systemd` |
+| Debian 11            | `deb` | `systemd` |
 | Ubuntu 16.04         | `deb` | `systemd` |
 | Ubuntu 18.04         | `deb` | `systemd` |
 | Ubuntu 20.04         | `deb` | `systemd` |
+| Ubuntu 22.04         | `deb` | `systemd` |
 | OpenSUSE Leap        | `rpm` | `systemd` |
 | OpenSUSE Tumbleweed  | `rpm` | `systemd` |
 | Oracle8              | `rpm` | `systemd` |
@@ -40,6 +36,7 @@ The `efs-utils` package has been verified against the following MacOS distributi
 | MacOS Monterey | `launchd`     |
 | MacOS Ventura  | `launchd`     |
 | MacOS Sonoma   | `launchd`     |
+| MacOS Sequoia  | `launchd`     |
 
 ## README contents
   - [Prerequisites](#prerequisites)
@@ -55,6 +52,7 @@ The `efs-utils` package has been verified against the following MacOS distributi
     - [MacOS](#macos)
     - [amazon-efs-mount-watchdog](#amazon-efs-mount-watchdog)
   - [Troubleshooting](#troubleshooting)
+  - [Upgrading to efs-utils v2.0.0](#upgrading-from-efs-utils-v1-to-v2)
   - [Upgrading stunnel for RHEL/CentOS](#upgrading-stunnel-for-rhelcentos)
   - [Upgrading stunnel for SLES12](#upgrading-stunnel-for-sles12)
   - [Upgrading stunnel for MacOS](#upgrading-stunnel-for-macos)
@@ -81,9 +79,11 @@ The `efs-utils` package has been verified against the following MacOS distributi
 ## Prerequisites
 
 * `nfs-utils` (RHEL/CentOS/Amazon Linux/Fedora) or `nfs-common` (Debian/Ubuntu)
-* OpenSSL 1.0.2+
-* Python 3.4+
+* OpenSSL-devel 1.0.2+
+* Python 3.7/3.8
 * `stunnel` 4.56+
+- `rust` 1.70+
+- `cargo`
 
 ## Optional
 
@@ -93,7 +93,7 @@ The `efs-utils` package has been verified against the following MacOS distributi
 
 ### On Amazon Linux distributions
 
-For those using Amazon Linux or Amazon Linux 2, the easiest way to install `efs-utils` is from Amazon's repositories:
+For those using Amazon Linux, the easiest way to install `efs-utils` is from Amazon's repositories:
 
 ```bash
 $ sudo yum -y install amazon-efs-utils
@@ -116,12 +116,19 @@ for more guidance.)
 
 Other distributions require building the package from source and installing it.
 
+If your distribution doesn't provide a rust or cargo package, or it provides versions
+that are older than 1.70, then you can install rust and cargo through rustup:
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
 - To build and install an RPM:
 
 If the distribution is not OpenSUSE or SLES
 
 ```bash
-$ sudo yum -y install git rpm-build make
+$ sudo yum -y install git rpm-build make rust cargo openssl-devel
 $ git clone https://github.com/aws/efs-utils
 $ cd efs-utils
 $ make rpm
@@ -132,7 +139,7 @@ Otherwise
 
 ```bash
 $ sudo zypper refresh
-$ sudo zypper install -y git rpm-build make
+$ sudo zypper install -y git rpm-build make rust cargo openssl-devel
 $ git clone https://github.com/aws/efs-utils
 $ cd efs-utils
 $ make rpm
@@ -152,18 +159,66 @@ sudo zypper refresh
 
 ```bash
 $ sudo apt-get update
-$ sudo apt-get -y install git binutils
+$ sudo apt-get -y install git binutils rustc cargo pkg-config libssl-dev gettext
 $ git clone https://github.com/aws/efs-utils
 $ cd efs-utils
 $ ./build-deb.sh
 $ sudo apt-get -y install ./build/amazon-efs-utils*deb
 ```
 
-### On MacOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura distribution
+If your Debian distribution doesn't provide a rust or cargo package, or your distribution provides versions
+that are older than 1.70, then you can install rust and cargo through rustup:
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
 
-For EC2 Mac instances running macOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura, you can install amazon-efs-utils from the 
+### Common installation issues with efs-utils v2.0.0
+**`make rpm` fails due to "feature `edition2021` is required"**:
+
+Update to a version of rust and cargo
+that is newer than 1.70. To install a new version of rust and cargo, run
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+```
+
+**You installed a new version of rust with the above command, but your system is still using the rust installed by the package manager**:
+
+When installing rust with the rustup script above, the script will fail if it detects a rust already exists on the system.
+Un-install the package manager's rust, and re-install rust through rustup. Once done, you will need to install rust through the package manager again to satisfy
+the RPM's dependencies.
+```bash
+yum remove cargo rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+yum install cargo rust
+. "$HOME/.cargo/env"
+```
+
+**When you run `make rpm`, compilation of efs-proxy fails due to `error: linker cc not found`**:
+
+Make sure that you have a linker installed on your system. For example, on Amazon Linux or RHEL, install gcc with
+```bash
+yum install gcc
+```
+
+**Installation Issue - Failed Build Dependencies**
+
+If rust dependencies was installed using rustup and the package manager does not have a rust and/or cargo package installed, you may see an error like this.
+
+```
+error: Failed build dependencies:
+    cargo is needed by amazon-efs-utils-2.1.0-1.el7_9.x86_64
+    rust is needed by amazon-efs-utils-2.1.0-1.el7_9.x86_64
+```
+
+In this case, the 'make rpm' command in the installation script above should be replaced by 'make rpm-without-system-rust' to remove the rpmbuild dependency check.
+
+### On macOS Sequoia, macOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura distribution
+
+For EC2 Mac instances running macOS Sequoia, macOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura, you can install amazon-efs-utils from the 
 [homebrew-aws](https://github.com/aws/homebrew-aws) respository. **Note that this will ONLY work on EC2 instances
-running macOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura, not local Mac computers.**
+running macOS Sequoia, macOS Big Sur, macOS Monterey, macOS Sonoma and macOS Ventura, not local Mac computers.**
 ```bash
 brew install amazon-efs-utils
 ```
@@ -194,8 +249,10 @@ $ make test
 ## Usage
 
 ### mount.efs
+`efs-utils` includes a mount helper utility, `mount.efs`, that simplifies and improves the performance of EFS file system mounts.
 
-`efs-utils` includes a mount helper utility to simplify mounting and using EFS file systems.
+`mount.efs` launches a proxy process that forwards NFS traffic from the kernel's NFS client to EFS.
+This proxy is responsible for TLS encryption, and for providing improved throughput performance.
 
 To mount with the recommended default options, simply run:
 
@@ -215,10 +272,16 @@ To mount file system within a given network namespace, run:
 $ sudo mount -t efs -o netns=netns-path file-system-id efs-mount-point/
 ```
 
-To mount file system to the mount target in specific availability zone (e.g. us-east-1a), run:
+To mount file system to the mount target in a specific availability zone (e.g. us-east-1a), run:
 
 ```bash
 $ sudo mount -t efs -o az=az-name file-system-id efs-mount-point/
+```
+
+To mount file system to the mount target in a specific region (e.g. us-east-1), run:
+
+```bash
+$ sudo mount -t efs -o region=region-name file-system-id efs-mount-point/
 ```
 
 **Note: The [prequisites in the crossaccount section below](#crossaccount-option-prerequisites) must be completed before using the crossaccount option.**
@@ -273,7 +336,7 @@ Given a client instance in Account A/VPC A and an EFS instance in Account B/VPC 
   - Create an EFS Mount Target in each of the Availability Zones from the above step in VPC B if they do not exist already.
   - Attach a VPC Security Group to each of the EFS Mount Targets which allow inbound NFS access from VPC A’s CIDR block.
 - Route 53 Setup:
-  - For a mount target A in <availability-zone-id>, create a Route 53 Hosted Zone for the domain <availability-zone-id>.<file-system-id>.efs.<aws-region>.amazonaws.com.
+  - For a mount target A in \<availability-zone-id>, create a Route 53 Hosted Zone for the domain \<availability-zone-id>.\<file-system-id>.efs.\<aws-region>.amazonaws.com.
   - Then, add an A record in the Hosted Zone which resolves to mount target A's IP Address. Leave the subdomain blank.
 
 
@@ -313,10 +376,21 @@ assist you if relevant logs are provided.  You can find the log file at `/var/lo
 Often times, enabling debug level logging can help us find problems more easily.  To do this, run  
 `sed -i '/logging_level = INFO/s//logging_level = DEBUG/g' /etc/amazon/efs/efs-utils.conf`.  
 
-You can also enable stunnel debug logs with  
+You can also enable stunnel and efs-proxy debug logs with  
 `sed -i '/stunnel_debug_enabled = false/s//stunnel_debug_enabled = true/g' /etc/amazon/efs/efs-utils.conf`.   
+These logs files will also be in `/var/log/amazon/efs/`.
 
 Make sure to perform the failed mount again after running the prior commands before pulling the logs.
+
+## Upgrading from efs-utils v1 to v2
+Efs-utils v2.0.0 replaces stunnel, which provides TLS encryptions for mounts, with efs-proxy, a component built in-house at AWS.
+Efs-proxy lays the foundation for upcoming feature launches at EFS.
+
+To utilize the improved performance benefits of efs-proxy, you must re-mount any existing mounts. 
+
+Efs-proxy is not compatible with OCSP or Mac clients. In these cases, efs-utils will automatically revert back to using stunnel.  
+
+If you are building efs-utils v2.0.0 from source, then you need Rust and Cargo >= 1.70.
 
 ## Upgrading stunnel for RHEL/CentOS
 

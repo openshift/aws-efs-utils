@@ -6,6 +6,8 @@
 # the License.
 #
 
+%bcond_without check
+
 %if 0%{?amzn1}
 %global python_requires python36
 %else
@@ -34,8 +36,12 @@
 %global efs_bindir /sbin
 %endif
 
+%global proxy_name efs-proxy
+
+%{?!include_vendor_tarball:%define include_vendor_tarball true}
+
 Name      : amazon-efs-utils
-Version   : 1.36.0
+Version   : 2.2.1
 Release   : 1%{platform}
 Summary   : This package provides utilities for simplifying the use of EFS file systems
 
@@ -43,8 +49,7 @@ Group     : Amazon/Tools
 License   : MIT
 URL       : https://aws.amazon.com/efs
 
-
-BuildArch : noarch
+BuildArchitectures: x86_64 aarch64
 
 Requires  : nfs-utils
 %if 0%{?amzn2}
@@ -67,13 +72,60 @@ Requires(preun)  : /sbin/service /sbin/chkconfig
 Requires(postun) : /sbin/service
 %endif
 
-Source    : %{name}.tar.gz
+# Conditional to allow building without
+# rust installed with yum
+%bcond_without system_rust
+
+# If yum provides rust and cargo
+# use rpmbuild --with system_rust
+%if %{with system_rust}
+BuildRequires: cargo rust
+%endif
+
+BuildRequires: openssl-devel
+
+Source0    : %{name}.tar.gz
+%if "%{include_vendor_tarball}" == "true"
+Source1    : %{proxy_name}-%{version}-vendor.tar.xz
+Source2    : config.toml
+%endif
 
 %description
 This package provides utilities for simplifying the use of EFS file systems
 
+%global debug_package %{nil}
+
 %prep
+
+# If yum doesn't provides rust and cargo
+# use rpmbuild --without system_rust
+%if %{without system_rust}
+source $HOME/.cargo/env || true
+%endif
+
+# Ensure cargo is installed
+if ! command -v cargo &> /dev/null; then
+    echo "Error: cargo is not in PATH. Please install cargo."
+    exit 1
+fi
+
+# Ensure rustc is installed
+if ! command -v rustc &> /dev/null; then
+    echo "Error: rustc is not PATH. Please install rustc."
+    exit 1
+fi
+
 %setup -n %{name}
+mkdir -p %{_builddir}/%{name}/src/proxy/.cargo
+%if "%{include_vendor_tarball}" == "true"
+cp %{SOURCE2} %{_builddir}/%{name}/src/proxy/.cargo/
+tar xf %{SOURCE1}
+mv vendor %{_builddir}/%{name}/src/proxy/
+%endif
+
+%build
+cd %{_builddir}/%{name}/src/proxy
+cargo build --release --manifest-path %{_builddir}/%{name}/src/proxy/Cargo.toml
 
 %install
 mkdir -p %{buildroot}%{_sysconfdir}/amazon/efs
@@ -95,6 +147,7 @@ install -p -m 444 %{_builddir}/%{name}/dist/efs-utils.crt %{buildroot}%{_sysconf
 install -p -m 755 %{_builddir}/%{name}/src/mount_efs/__init__.py %{buildroot}%{efs_bindir}/mount.efs
 install -p -m 755 %{_builddir}/%{name}/src/watchdog/__init__.py %{buildroot}%{_bindir}/amazon-efs-mount-watchdog
 install -p -m 644 %{_builddir}/%{name}/man/mount.efs.8 %{buildroot}%{_mandir}/man8
+install -p -m 755 %{_builddir}/%{name}/src/proxy/target/release/efs-proxy %{buildroot}%{efs_bindir}/efs-proxy
 
 %files
 %defattr(-,root,root,-)
@@ -105,6 +158,7 @@ install -p -m 644 %{_builddir}/%{name}/man/mount.efs.8 %{buildroot}%{_mandir}/ma
 %endif
 %{_sysconfdir}/amazon/efs/efs-utils.crt
 %{efs_bindir}/mount.efs
+%{efs_bindir}/efs-proxy
 %{_bindir}/amazon-efs-mount-watchdog
 /var/log/amazon
 %{_mandir}/man8/mount.efs.8.gz
@@ -138,6 +192,35 @@ fi
 %clean
 
 %changelog
+* Thu Mar 06 2025 Daniel Luthcke <dluthcke@amazon.com> - 2.2.1
+- Readme Updates
+- Update log4rs to mitigate CVE-2020-35881
+
+* Wed Nov 13 2024 Anthony Tse <anthotse@amazon.com> - 2.2.0
+- Use region-specific domain suffixes for dns endpoints where missing
+- Merge PR #211 - Amend Debian control to use binary architecture
+
+* Wed Sep 18 2024 Julie Rakas <jrakas@amazon.com> - 2.1.0
+- Add mount option for specifying region
+- Add new ISO regions to config file
+
+* Tue Jun 25 2024 Anthony Tse <anthotse@amazon.com> - 2.0.4
+- Add retry logic to and increase timeout for EC2 metadata token retrieval requests
+
+* Tue Jun 18 2024 Arnav Gupta <arnavgup@amazon.com> - 2.0.3
+- Upgrade py version
+- Replace deprecated usage of datetime
+
+* Mon May 20 2024 Anthony Tse <anthotse@amazon.com> - 2.0.2
+- Check for efs-proxy PIDs when cleaning tunnel state files
+- Add PID to log entries
+
+* Tue Apr 23 2024 Ryan Stankiewicz <rjstank@amazon.com> - 2.0.1
+- Disable Nagle's algorithm for efs-proxy TLS mounts to improve latencies
+
+* Mon Apr 08 2024 Ryan Stankiewicz <rjstank@amazon.com> - 2.0.0
+- Replace stunnel, which provides TLS encryptions for mounts, with efs-proxy, a component built in-house at AWS. Efs-proxy lays the foundation for upcoming feature launches at EFS.
+
 * Mon Mar 18 2024 Sean Zatz <zatzsea@amazon.com> - 1.36.0
 - Support new mount option: crossaccount, conduct cross account mounts via ip address. Use client AZ-ID to choose mount target.
 
@@ -156,7 +239,7 @@ fi
 - Add debug statement for size of state file write
 - Add parameters in mount options for assume web role with web identity
 
-* Wed Jan 1 2023 Ryan Stankiewicz <rjstank@amazon.com> - 1.34.5
+* Wed Jan 4 2023 Ryan Stankiewicz <rjstank@amazon.com> - 1.34.5
 - Watchdog detect empty private key and regenerate
 - Update man page
 - Avoid redundant get_target_region call
