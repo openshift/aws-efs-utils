@@ -7,7 +7,7 @@
 # - /var/log/amazon/efs/*
 # - botocore3 (to be able to use zonal EFS volumes)
 
-FROM registry.ci.openshift.org/ocp/4.21:base-rhel9
+FROM registry.ci.openshift.org/ocp/4.22:base-rhel9
 
 # create log file
 RUN mkdir -p /var/log/amazon/efs
