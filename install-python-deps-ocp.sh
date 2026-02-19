@@ -8,7 +8,7 @@
 set -euxo pipefail
 
 yum update -y
-yum install --setopt=tsflags=nodocs -y nfs-utils stunnel python3 openssl util-linux which make python3-pip python3-jmespath python3-urllib3 python3-attrs python3-py python3-tomli python3-iniconfig python3-six.noarch python3-wheel
+yum install --setopt=tsflags=nodocs -y nfs-utils stunnel python3 openssl util-linux which make python3-pip python3-jmespath python3-urllib3 python3-attrs python3-py python3-tomli python3-iniconfig python3-six.noarch python3-wheel python3-dateutil
 yum clean all
 rm -rf /var/cache/yum/*
 
