@@ -2059,11 +2059,14 @@ def check_if_nfsvers_is_compatible_with_macos(options):
 # Use stunnel instead of efs-proxy for tls mounts,
 # and attach non-tls mounts directly to the mount target.
 def legacy_stunnel_mode_enabled(options, config):
-    return (
-        LEGACY_STUNNEL_MOUNT_OPTION in options
-        or check_if_platform_is_mac()
-        or is_ocsp_enabled(config, options)
-    )
+    # OpenShift CARRY: Enable stunnel for all connections
+    return True
+
+    # return (
+        # LEGACY_STUNNEL_MOUNT_OPTION in options
+        # or check_if_platform_is_mac()
+        # or is_ocsp_enabled(config, options)
+    # )
 
 
 def get_nfs_mount_options(options, config):
