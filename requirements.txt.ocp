@@ -1,0 +1,8 @@
+# OpenShift carry: requirements.txt tailored for OpenShift image build.
+
+# WARNING: to keep nr. of deps small, we remove most of unit-test dependencies!
+# `make test` won't work in the image build env.
+
+# All versions except botocore are set to the versions that are available in RHEL.
+# botocore is not in RHEL9, download it from the internet (for local development) / cache (for real image builds).
+botocore==1.34.140
