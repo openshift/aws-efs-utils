@@ -24,6 +24,8 @@ COPY ./src/watchdog/__init__.py /usr/bin/amazon-efs-mount-watchdog
 RUN chmod 755 /usr/bin/amazon-efs-mount-watchdog
 
 # Copy cachito / hermeto files used in the build pipeline. Copy an innocent file if the env. vars are not set.
+ARG REMOTE_SOURCES
+ARG REMOTE_SOURCES_DIR
 ENV REMOTE_SOURCES_SRC=${REMOTE_SOURCES:-"requirements.txt"}
 ENV REMOTE_SOURCES_DST=${REMOTE_SOURCES_DIR:-"/remote_sources_dir/"}
 COPY "$REMOTE_SOURCES_SRC" "$REMOTE_SOURCES_DST"

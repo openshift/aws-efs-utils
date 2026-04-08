@@ -34,6 +34,7 @@ import base64
 import errno
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -47,7 +48,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 
 try:
@@ -85,7 +86,7 @@ except ImportError:
     BOTOCORE_PRESENT = False
 
 
-VERSION = "1.36.0"
+VERSION = "2.4.2"
 SERVICE = "elasticfilesystem"
 
 AMAZON_LINUX_2_RELEASE_ID = "Amazon Linux release 2 (Karoo)"
@@ -94,6 +95,7 @@ AMAZON_LINUX_2_RELEASE_VERSIONS = [
     AMAZON_LINUX_2_RELEASE_ID,
     AMAZON_LINUX_2_PRETTY_NAME,
 ]
+UBUNTU_24_RELEASE = "Ubuntu 24"
 
 CLONE_NEWNET = 0x40000000
 CONFIG_FILE = "/etc/amazon/efs/efs-utils.conf"
@@ -105,11 +107,11 @@ CLOUDWATCHLOG_AGENT = None
 CLOUDWATCH_LOG_SECTION = "cloudwatch-log"
 DEFAULT_CLOUDWATCH_LOG_GROUP = "/aws/efs/utils"
 DEFAULT_FALLBACK_ENABLED = True
-DEFAULT_RETENTION_DAYS = 14
 DEFAULT_UNKNOWN_VALUE = "unknown"
 # 50ms
 DEFAULT_TIMEOUT = 0.05
 DEFAULT_MACOS_VALUE = "macos"
+DEFAULT_GET_AWS_EC2_METADATA_TOKEN_RETRY_COUNT = 3
 DEFAULT_NFS_MOUNT_COMMAND_RETRY_COUNT = 3
 DEFAULT_NFS_MOUNT_COMMAND_TIMEOUT_SEC = 15
 DISABLE_FETCH_EC2_METADATA_TOKEN_ITEM = "disable_fetch_ec2_metadata_token"
@@ -187,14 +189,14 @@ REQUEST_PAYLOAD = ""
 
 FS_ID_RE = re.compile("^(?P<fs_id>fs-[0-9a-f]+)$")
 EFS_FQDN_RE = re.compile(
-    r"^((?P<az>[a-z0-9-]+)\.)?(?P<fs_id>fs-[0-9a-f]+)\.efs\."
-    r"(?P<region>[a-z0-9-]+)\.(?P<dns_name_suffix>[a-z0-9.]+)$"
+    r"^((?P<az>[a-z0-9-]+)\.)?(?P<fs_id>fs-[0-9a-f]+)\.(?:[a-z-]+\.)+"
+    r"(?P<region>[a-z0-9-]+)\.(?P<dns_name_suffix>[a-z0-9.-]+)$"
 )
 AP_ID_RE = re.compile("^fsap-[0-9a-f]{17}$")
 
 CREDENTIALS_KEYS = ["AccessKeyId", "SecretAccessKey", "Token"]
 ECS_TASK_METADATA_API = "http://169.254.170.2"
-STS_ENDPOINT_URL_FORMAT = "https://sts.{}.amazonaws.com/"
+STS_ENDPOINT_URL_FORMAT = "https://sts.{}.{}/"
 INSTANCE_METADATA_TOKEN_URL = "http://169.254.169.254/latest/api/token"
 INSTANCE_METADATA_SERVICE_URL = (
     "http://169.254.169.254/latest/dynamic/instance-identity/document/"
@@ -222,8 +224,12 @@ SECURITY_CREDS_IAM_ROLE_HELP_URL = (
 DEFAULT_STUNNEL_VERIFY_LEVEL = 2
 DEFAULT_STUNNEL_CAFILE = "/etc/amazon/efs/efs-utils.crt"
 
+LEGACY_STUNNEL_MOUNT_OPTION = "stunnel"
+
 NOT_BEFORE_MINS = 15
 NOT_AFTER_HOURS = 3
+
+EFS_PROXY_TLS_OPTION = "--tls"
 
 EFS_ONLY_OPTIONS = [
     "accesspoint",
@@ -237,13 +243,14 @@ EFS_ONLY_OPTIONS = [
     "noocsp",
     "notls",
     "ocsp",
+    "region",
     "tls",
     "tlsport",
     "verify",
     "rolearn",
     "jwtpath",
-    "fsap",
     "crossaccount",
+    LEGACY_STUNNEL_MOUNT_OPTION,
 ]
 
 UNSUPPORTED_OPTIONS = ["capath"]
@@ -278,6 +285,8 @@ MACOS_BIG_SUR_RELEASE = "macOS-11"
 MACOS_MONTEREY_RELEASE = "macOS-12"
 MACOS_VENTURA_RELEASE = "macOS-13"
 MACOS_SONOMA_RELEASE = "macOS-14"
+MACOS_SEQUOIA_RELEASE = "macOS-15"
+MACOS_TAHOE_RELEASE = "macOS-26"
 
 
 # Multiplier for max read ahead buffer size
@@ -292,11 +301,13 @@ SKIP_NO_SO_BINDTODEVICE_RELEASES = [
     MACOS_MONTEREY_RELEASE,
     MACOS_VENTURA_RELEASE,
     MACOS_SONOMA_RELEASE,
+    MACOS_SEQUOIA_RELEASE,
+    MACOS_TAHOE_RELEASE,
 ]
 
 MAC_OS_PLATFORM_LIST = ["darwin"]
-# MacOS Versions : Sonoma - 23.*, Ventura - 22.*, Monterey - 21.*, Big Sur - 20.*, Catalina - 19.*, Mojave - 18.*. Catalina and Mojave are not supported for now
-MAC_OS_SUPPORTED_VERSION_LIST = ["20", "21", "22", "23"]
+# MacOS Versions : Tahoe - 25.*, Sequoia - 24.*, Sonoma - 23.*, Ventura - 22.*, Monterey - 21.*, Big Sur - 20.*, Catalina - 19.*, Mojave - 18.*. Catalina and Mojave are not supported for now
+MAC_OS_SUPPORTED_VERSION_LIST = ["20", "21", "22", "23", "24", "25"]
 
 AWS_FIPS_ENDPOINT_CONFIG_ENV = "AWS_USE_FIPS_ENDPOINT"
 ECS_URI_ENV = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
@@ -306,6 +317,16 @@ WEB_IDENTITY_TOKEN_FILE_ENV = "AWS_WEB_IDENTITY_TOKEN_FILE"
 ECS_FARGATE_TASK_METADATA_ENDPOINT_ENV = "ECS_CONTAINER_METADATA_URI_V4"
 ECS_FARGATE_TASK_METADATA_ENDPOINT_URL_EXTENSION = "/task"
 ECS_FARGATE_CLIENT_IDENTIFIER = "ecs.fargate"
+
+AWS_CONTAINER_CREDS_FULL_URI_ENV = "AWS_CONTAINER_CREDENTIALS_FULL_URI"
+AWS_CONTAINER_AUTH_TOKEN_FILE_ENV = "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
+
+
+def is_ipv6_address(ip_address):
+    try:
+        return isinstance(ipaddress.ip_address(ip_address), ipaddress.IPv6Address)
+    except ValueError:
+        return False
 
 
 def errcheck(ret, func, args):
@@ -364,13 +385,23 @@ def fatal_error(user_message, log_message=None, exit_code=1):
     sys.exit(exit_code)
 
 
-def get_target_region(config):
+def get_target_region(config, options):
     def _fatal_error(message):
         fatal_error(
             'Error retrieving region. Please set the "region" parameter '
-            "in the efs-utils configuration file.",
+            "in the efs-utils configuration file or specify it as a "
+            "mount option.",
             message,
         )
+
+    # Check mount option first
+    if "region" in options:
+        return options.get("region")
+
+    # Check environment variable
+    env_region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    if env_region:
+        return env_region
 
     try:
         return config.get(CONFIG_SECTION, "region")
@@ -607,44 +638,73 @@ def fetch_ec2_metadata_token_disabled(config):
     )
 
 
-def get_aws_ec2_metadata_token(timeout=DEFAULT_TIMEOUT):
-    # Normally the session token is fetched within 10ms, setting a timeout of 50ms here to abort the request
-    # and return None if the token has not returned within 50ms
-    try:
-        opener = build_opener(HTTPHandler)
-        request = Request(INSTANCE_METADATA_TOKEN_URL)
+def get_aws_ec2_metadata_token(
+    request_timeout=0.5,
+    max_retries=DEFAULT_GET_AWS_EC2_METADATA_TOKEN_RETRY_COUNT,
+    retry_delay=0.5,
+):
+    """
+    Retrieves the AWS EC2 metadata token. Typically, the token is fetched
+    within 10ms. We set a default timeout of 0.5 seconds to prevent mount
+    failures caused by slow requests.
 
-        request.add_header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
-        request.get_method = lambda: "PUT"
+    Args:
+        max_retries (int): The maximum number of retries.
+        retry_delay (int): The delay in seconds between retries.
+
+    Returns:
+        The AWS EC2 metadata token str or None if it cannot be retrieved.
+    """
+
+    def get_token(timeout):
         try:
-            res = opener.open(request, timeout=timeout)
-            return res.read()
-        except socket.timeout:
-            exception_message = "Timeout when getting the aws ec2 metadata token"
-        except HTTPError as e:
-            exception_message = "Failed to fetch token due to %s" % e
-        except Exception as e:
-            exception_message = (
-                "Unknown error when fetching aws ec2 metadata token, %s" % e
+            opener = build_opener(HTTPHandler)
+            request = Request(INSTANCE_METADATA_TOKEN_URL)
+            request.add_header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+            request.get_method = lambda: "PUT"
+            try:
+                response = opener.open(request, timeout=timeout)
+                return response.read()
+            finally:
+                opener.close()
+
+        except NameError:
+            headers = {"X-aws-ec2-metadata-token-ttl-seconds": "21600"}
+            request = Request(
+                INSTANCE_METADATA_TOKEN_URL, headers=headers, method="PUT"
             )
-        logging.debug(exception_message)
-        return None
-    except NameError:
-        headers = {"X-aws-ec2-metadata-token-ttl-seconds": "21600"}
-        req = Request(INSTANCE_METADATA_TOKEN_URL, headers=headers, method="PUT")
+            response = urlopen(request, timeout=timeout)
+            return response.read()
+
+    retries = 0
+    while retries < max_retries:
         try:
-            res = urlopen(req, timeout=timeout)
-            return res.read()
+            return get_token(timeout=request_timeout)
         except socket.timeout:
-            exception_message = "Timeout when getting the aws ec2 metadata token"
-        except HTTPError as e:
-            exception_message = "Failed to fetch token due to %s" % e
-        except Exception as e:
-            exception_message = (
-                "Unknown error when fetching aws ec2 metadata token, %s" % e
+            logging.debug(
+                "Timeout when getting the aws ec2 metadata token. Attempt: %s/%s"
+                % (retries + 1, max_retries)
             )
-        logging.debug(exception_message)
-        return None
+        except HTTPError as e:
+            logging.debug(
+                "Failed to fetch token due to %s. Attempt: %s/%s"
+                % (e, retries + 1, max_retries)
+            )
+        except Exception as e:
+            logging.debug(
+                "Unknown error when fetching aws ec2 metadata token, %s. Attempt: %s/%s"
+                % (e, retries + 1, max_retries)
+            )
+
+        retries += 1
+        if retries < max_retries:
+            logging.debug("Retrying in %s seconds", retry_delay)
+            time.sleep(retry_delay)
+        else:
+            logging.debug(
+                "Unable to retrieve AWS EC2 metadata token. Maximum number of retries reached."
+            )
+            return None
 
 
 def get_aws_security_credentials(
@@ -686,6 +746,13 @@ def get_aws_security_credentials(
         )
         if credentials and credentials_source:
             return credentials, credentials_source
+
+    # attempt to lookup AWS security credentials through Pod Identity
+    credentials, credentials_source = get_aws_security_credentials_from_pod_identity(
+        config, False
+    )
+    if credentials and credentials_source:
+        return credentials, credentials_source
 
     # attempt to lookup AWS security credentials through AssumeRoleWithWebIdentity
     # (e.g. for IAM Role for Service Accounts (IRSA) approach on EKS)
@@ -794,9 +861,9 @@ def get_aws_security_credentials_from_webidentity(
         else:
             return None, None
 
-    STS_ENDPOINT_URL = STS_ENDPOINT_URL_FORMAT.format(region)
+    sts_endpoint_url = get_sts_endpoint_url(config, region)
     webidentity_url = (
-        STS_ENDPOINT_URL
+        sts_endpoint_url
         + "?"
         + urlencode(
             {
@@ -810,11 +877,11 @@ def get_aws_security_credentials_from_webidentity(
     )
 
     unsuccessful_resp = (
-        "Unsuccessful retrieval of AWS security credentials at %s." % STS_ENDPOINT_URL
+        "Unsuccessful retrieval of AWS security credentials at %s." % sts_endpoint_url
     )
     url_error_msg = (
         "Unable to reach %s to retrieve AWS security credentials. See %s for more info."
-        % (STS_ENDPOINT_URL, SECURITY_CREDS_WEBIDENTITY_HELP_URL)
+        % (sts_endpoint_url, SECURITY_CREDS_WEBIDENTITY_HELP_URL)
     )
     resp = url_request_helper(
         config,
@@ -842,6 +909,80 @@ def get_aws_security_credentials_from_webidentity(
         fatal_error(unsuccessful_resp, unsuccessful_resp)
     else:
         return None, None
+
+
+def get_aws_security_credentials_from_pod_identity(config, is_fatal=False):
+    if (
+        AWS_CONTAINER_CREDS_FULL_URI_ENV not in os.environ
+        or AWS_CONTAINER_AUTH_TOKEN_FILE_ENV not in os.environ
+    ):
+        return None, None
+
+    creds_uri = os.environ[AWS_CONTAINER_CREDS_FULL_URI_ENV]
+    token_file = os.environ[AWS_CONTAINER_AUTH_TOKEN_FILE_ENV]
+
+    try:
+        with open(token_file, "r") as f:
+            token = f.read().strip()
+            if "\r" in token or "\n" in token:
+                if is_fatal:
+                    unsuccessful_resp = (
+                        "AWS Container Auth Token contains invalid characters"
+                    )
+                    fatal_error(unsuccessful_resp, unsuccessful_resp)
+                return None, None
+    except Exception as e:
+        if is_fatal:
+            unsuccessful_resp = (
+                f"Error reading Aws Container Auth Token file {token_file}: {e}"
+            )
+            fatal_error(unsuccessful_resp, unsuccessful_resp)
+        return None, None
+
+    unsuccessful_resp = f"Unsuccessful retrieval of AWS security credentials from Container Credentials URI at {creds_uri}"
+    url_error_msg = f"Unable to reach Container Credentials URI at {creds_uri}"
+
+    pod_identity_security_dict = url_request_helper(
+        config,
+        creds_uri,
+        unsuccessful_resp,
+        url_error_msg,
+        headers={"Authorization": token},
+    )
+
+    if pod_identity_security_dict and all(
+        k in pod_identity_security_dict for k in CREDENTIALS_KEYS
+    ):
+        return pod_identity_security_dict, f"podidentity:{creds_uri},{token_file}"
+
+    if is_fatal:
+        fatal_error(unsuccessful_resp, unsuccessful_resp)
+    return None, None
+
+
+def get_sts_endpoint_url(config, region):
+    dns_name_suffix = get_dns_name_suffix(config, region)
+    return STS_ENDPOINT_URL_FORMAT.format(region, dns_name_suffix)
+
+
+def get_dns_name_suffix(config, region):
+    return get_mount_config(config, region, "dns_name_suffix")
+
+
+def get_mount_config(config, region, config_name):
+    try:
+        config_section = get_config_section(config, region)
+        return config.get(config_section, config_name)
+    except NoOptionError:
+        pass
+
+    try:
+        return config.get(CONFIG_SECTION, config_name)
+    except NoOptionError:
+        fatal_error(
+            f"Error retrieving config. Please set the {config_name} configuration "
+            "in efs-utils.conf"
+        )
 
 
 def get_aws_security_credentials_from_instance_metadata(config, iam_role_name):
@@ -939,7 +1080,13 @@ def botocore_credentials_helper(awsprofile):
 
 
 def get_aws_profile(options, use_iam):
+    # Check mount option first
     awsprofile = options.get("awsprofile")
+
+    # If not provided, check environment variable
+    if not awsprofile:
+        awsprofile = os.environ.get("AWS_PROFILE")
+
     if not awsprofile and use_iam:
         for file_path in [AWS_CREDENTIALS_FILE, AWS_CONFIG_FILE]:
             aws_credentials_configs = read_config(file_path)
@@ -1039,6 +1186,11 @@ def get_resp_obj(request_resp, url, unsuccessful_resp):
 
 
 def parse_options(options):
+    """
+    Parses a comma delineated string of key=value options (e.g. 'opt1,opt2=val').
+    Returns a dictionary of key,value pairs, where value = None if
+    it was not provided.
+    """
     opts = {}
     for o in options.split(","):
         if "=" in o:
@@ -1172,7 +1324,8 @@ def serialize_stunnel_config(config, header=None):
     return lines
 
 
-def add_stunnel_ca_options(efs_config, config, options, region):
+# These options are used by both stunnel and efs-proxy for TLS mounts
+def add_tunnel_ca_options(efs_config, config, options, region):
     if "cafile" in options:
         stunnel_cafile = options["cafile"]
     else:
@@ -1257,6 +1410,11 @@ def _stunnel_bin():
         return find_command_path("stunnel", installation_message)
 
 
+def _efs_proxy_bin():
+    error_message = "The efs-proxy binary is packaged with efs-utils. It was deleted or not installed correctly."
+    return find_command_path("efs-proxy", error_message)
+
+
 def find_command_path(command, install_method):
     # If not running on macOS, use linux paths
     if not check_if_platform_is_mac():
@@ -1267,10 +1425,15 @@ def find_command_path(command, install_method):
     # For more information, see https://brew.sh/2021/02/05/homebrew-3.0.0/
     else:
         env_path = "/opt/homebrew/bin:/usr/local/bin"
-    os.putenv("PATH", env_path)
+
+    existing_path = os.environ.get("PATH", "")
+    search_path = env_path + ":" + existing_path if existing_path else env_path
+
+    env = os.environ.copy()
+    env["PATH"] = search_path
 
     try:
-        path = subprocess.check_output(["which", command])
+        path = subprocess.check_output(["which", command], env=env)
         return path.strip().decode()
     except subprocess.CalledProcessError as e:
         fatal_error(
@@ -1314,24 +1477,26 @@ def write_stunnel_config_file(
     log_dir=LOG_DIR,
     cert_details=None,
     fallback_ip_address=None,
+    efs_proxy_enabled=True,
 ):
     """
     Serializes stunnel configuration to a file. Unfortunately this does not conform to Python's config file format, so we have to
     hand-serialize it.
     """
 
-    stunnel_options = get_stunnel_options()
+    stunnel_options = [] if efs_proxy_enabled else get_stunnel_options()
     mount_filename = get_mount_specific_filename(fs_id, mountpoint, tls_port)
 
     system_release_version = get_system_release_version()
     global_config = dict(STUNNEL_GLOBAL_CONFIG)
 
-    if is_stunnel_option_supported(
+    if not efs_proxy_enabled and is_stunnel_option_supported(
         stunnel_options, b"foreground", b"quiet", emit_warning_log=False
     ):
         # Do not log to stderr of subprocess in addition to the destinations specified with syslog and output.
         # Only support in stunnel version 5.25+.
         global_config["foreground"] = "quiet"
+
     if any(
         release in system_release_version
         for release in SKIP_NO_SO_BINDTODEVICE_RELEASES
@@ -1350,12 +1515,17 @@ def write_stunnel_config_file(
                 CONFIG_SECTION, "stunnel_logs_file"
             ).replace("{fs_id}", fs_id)
         else:
-            global_config["output"] = os.path.join(
-                log_dir, "%s.stunnel.log" % mount_filename
+            proxy_log_file = (
+                "%s.efs-proxy.log" if efs_proxy_enabled else "%s.stunnel.log"
             )
+            global_config["output"] = os.path.join(
+                log_dir, proxy_log_file % mount_filename
+            )
+
     global_config["pid"] = os.path.join(
         state_file_dir, mount_filename + "+", "stunnel.pid"
     )
+
     if get_fips_config(config):
         global_config["fips"] = "yes"
 
@@ -1367,9 +1537,11 @@ def write_stunnel_config_file(
     else:
         efs_config["connect"] = efs_config["connect"] % dns_name
 
-    efs_config["verify"] = verify_level
-    if verify_level > 0:
-        add_stunnel_ca_options(efs_config, config, options, region)
+    # Verify level is only valid for tls mounts
+    if (verify_level is not None) and tls_enabled(options):
+        efs_config["verify"] = verify_level
+        if verify_level > 0:
+            add_tunnel_ca_options(efs_config, config, options, region)
 
     if cert_details:
         efs_config["cert"] = cert_details["certificate"]
@@ -1381,27 +1553,33 @@ def write_stunnel_config_file(
         % (CONFIG_FILE, "https://docs.aws.amazon.com/console/efs/troubleshooting-tls")
     )
 
-    if get_boolean_config_item_value(
-        config, CONFIG_SECTION, "stunnel_check_cert_hostname", default_value=True
-    ):
-        if is_stunnel_option_supported(stunnel_options, b"checkHost"):
-            # Stunnel checkHost option checks if the specified DNS host name or wildcard matches any of the provider in peer
-            # certificate's CN fields, after introducing the AZ field in dns name, the host name in the stunnel config file
-            # is not valid, remove the az info there
-            efs_config["checkHost"] = dns_name[dns_name.index(fs_id) :]
-        else:
-            fatal_error(tls_controls_message % "stunnel_check_cert_hostname")
+    if tls_enabled(options):
+        # These config options are not applicable to non-tls mounts with efs-proxy
+        if get_boolean_config_item_value(
+            config, CONFIG_SECTION, "stunnel_check_cert_hostname", default_value=True
+        ):
+            if (not efs_proxy_enabled) and (
+                not is_stunnel_option_supported(stunnel_options, b"checkHost")
+            ):
+                fatal_error(tls_controls_message % "stunnel_check_cert_hostname")
+            else:
+                efs_config["checkHost"] = dns_name[dns_name.index(fs_id) :]
 
-    # Only use the config setting if the override is not set
-    if ocsp_enabled:
-        if is_stunnel_option_supported(stunnel_options, b"OCSPaia"):
-            efs_config["OCSPaia"] = "yes"
-        else:
-            fatal_error(tls_controls_message % "stunnel_check_cert_validity")
+        if not efs_proxy_enabled and is_ipv6_address(fallback_ip_address):
+            efs_config["sni"] = dns_name[dns_name.index(fs_id) :]
+
+        # Only use the config setting if the override is not set
+        if not efs_proxy_enabled and ocsp_enabled:
+            if is_stunnel_option_supported(stunnel_options, b"OCSPaia"):
+                efs_config["OCSPaia"] = "yes"
+            else:
+                fatal_error(tls_controls_message % "stunnel_check_cert_validity")
 
     # If the stunnel libwrap option is supported, we disable the usage of /etc/hosts.allow and /etc/hosts.deny by
     # setting the option to no
-    if is_stunnel_option_supported(stunnel_options, b"libwrap"):
+    if not efs_proxy_enabled and is_stunnel_option_supported(
+        stunnel_options, b"libwrap"
+    ):
         efs_config["libwrap"] = "no"
 
     stunnel_config = "\n".join(
@@ -1420,7 +1598,7 @@ def write_stunnel_config_file(
     return stunnel_config_file
 
 
-def write_tls_tunnel_state_file(
+def write_tunnel_state_file(
     fs_id,
     mountpoint,
     tls_port,
@@ -1433,6 +1611,8 @@ def write_tls_tunnel_state_file(
     """
     Return the name of the temporary file containing TLS tunnel state, prefixed with a '~'. This file needs to be renamed to a
     non-temporary version following a successful mount.
+
+    The "tunnel" here refers to efs-proxy, or stunnel.
     """
     state_file = "~" + get_mount_specific_filename(fs_id, mountpoint, tls_port)
 
@@ -1453,19 +1633,19 @@ def write_tls_tunnel_state_file(
     return state_file
 
 
-def rewrite_tls_tunnel_state_file(state, state_file_dir, state_file):
+def rewrite_tunnel_state_file(state, state_file_dir, state_file):
     with open(os.path.join(state_file_dir, state_file), "w") as f:
         json.dump(state, f)
     return state_file
 
 
-def update_tls_tunnel_temp_state_file_with_tunnel_pid(
+def update_tunnel_temp_state_file_with_tunnel_pid(
     temp_tls_state_file, state_file_dir, stunnel_pid
 ):
     with open(os.path.join(state_file_dir, temp_tls_state_file), "r") as f:
         state = json.load(f)
     state["pid"] = stunnel_pid
-    temp_tls_state_file = rewrite_tls_tunnel_state_file(
+    temp_tls_state_file = rewrite_tunnel_state_file(
         state, state_file_dir, temp_tls_state_file
     )
     return temp_tls_state_file
@@ -1476,9 +1656,9 @@ def test_tunnel_process(tunnel_proc, fs_id):
     if tunnel_proc.returncode is not None:
         _, err = tunnel_proc.communicate()
         fatal_error(
-            "Failed to initialize TLS tunnel for %s, please check mount.log for the failure reason."
+            "Failed to initialize tunnel for %s, please check mount.log for the failure reason."
             % fs_id,
-            'Failed to start TLS tunnel (errno=%d), stderr="%s". If the stderr is lacking enough details, please '
+            'Failed to start tunnel (errno=%d), stderr="%s". If the stderr is lacking enough details, please '
             "enable stunnel debug log in efs-utils config file and retry the mount to capture more info."
             % (tunnel_proc.returncode, err.strip()),
         )
@@ -1642,8 +1822,12 @@ def get_tls_port_from_sock(tls_port_sock):
     return tls_port_sock.getsockname()[1]
 
 
+def tls_enabled(options):
+    return "tls" in options
+
+
 @contextmanager
-def bootstrap_tls(
+def bootstrap_proxy(
     config,
     init_system,
     dns_name,
@@ -1652,85 +1836,115 @@ def bootstrap_tls(
     options,
     state_file_dir=STATE_FILE_DIR,
     fallback_ip_address=None,
+    efs_proxy_enabled=True,
 ):
-    tls_port_sock = choose_tls_port_and_get_bind_sock(config, options, state_file_dir)
-    tls_port = get_tls_port_from_sock(tls_port_sock)
+    """
+    Generates a TLS private key and client-side certificate, a stunnel configuration file, and a state file
+    that is used to pass information to the Watchdog process.
+
+    This function will spin up a stunnel or efs-proxy process, and pass it the stunnel configuration file.
+    The client-side certificate generated by this function contains IAM information that can be used by the EFS backend to enforce
+    file system policies.
+
+    The state file passes information about the mount and the associated proxy process (whether that's stunnel or efs-proxy) to
+    the Watchdog daemon service. This allows Watchdog to monitor the proxy process's health.
+
+    This function will yield a handle on the proxy process, whether it's efs-proxy or stunnel.
+    """
+
+    proxy_listen_sock = choose_tls_port_and_get_bind_sock(
+        config, options, state_file_dir
+    )
+    proxy_listen_port = get_tls_port_from_sock(proxy_listen_sock)
 
     try:
         # override the tlsport option so that we can later override the port the NFS client uses to connect to stunnel.
         # if the user has specified tlsport=X at the command line this will just re-set tlsport to X.
-        options["tlsport"] = tls_port
+        options["tlsport"] = proxy_listen_port
 
         use_iam = "iam" in options
         ap_id = options.get("accesspoint")
-        cert_details = {}
+        cert_details = None
         security_credentials = None
         client_info = get_client_info(config)
-        region = get_target_region(config)
+        region = get_target_region(config, options)
 
-        if use_iam:
-            aws_creds_uri = options.get("awscredsuri")
-            role_arn = options.get("rolearn")
-            jwt_path = options.get("jwtpath")
-            if aws_creds_uri:
-                kwargs = {"aws_creds_uri": aws_creds_uri}
-            elif role_arn and jwt_path:
-                kwargs = {"role_arn": role_arn, "jwt_path": jwt_path}
-            else:
-                kwargs = {"awsprofile": get_aws_profile(options, use_iam)}
+        if tls_enabled(options):
+            cert_details = {}
+            # IAM can only be used for tls mounts
+            if use_iam:
+                aws_creds_uri = options.get("awscredsuri")
+                role_arn = options.get("rolearn")
+                jwt_path = options.get("jwtpath")
+                if aws_creds_uri:
+                    kwargs = {"aws_creds_uri": aws_creds_uri}
+                elif role_arn and jwt_path:
+                    kwargs = {"role_arn": role_arn, "jwt_path": jwt_path}
+                else:
+                    kwargs = {"awsprofile": get_aws_profile(options, use_iam)}
 
-            security_credentials, credentials_source = get_aws_security_credentials(
-                config, use_iam, region, **kwargs
-            )
-
-            if credentials_source:
-                cert_details["awsCredentialsMethod"] = credentials_source
-                logging.debug(
-                    "AWS credentials source used for IAM authentication: ",
-                    credentials_source,
+                security_credentials, credentials_source = get_aws_security_credentials(
+                    config, use_iam, region, **kwargs
                 )
 
-        if ap_id:
-            cert_details["accessPoint"] = ap_id
+                if credentials_source:
+                    cert_details["awsCredentialsMethod"] = credentials_source
+                    logging.debug(
+                        "AWS credentials source used for IAM authentication: %s",
+                        credentials_source,
+                    )
 
-        # additional symbol appended to avoid naming collisions
-        cert_details["mountStateDir"] = (
-            get_mount_specific_filename(fs_id, mountpoint, tls_port) + "+"
-        )
-        # common name for certificate signing request is max 64 characters
-        cert_details["commonName"] = socket.gethostname()[0:64]
-        cert_details["region"] = region
-        cert_details["certificateCreationTime"] = create_certificate(
-            config,
-            cert_details["mountStateDir"],
-            cert_details["commonName"],
-            cert_details["region"],
-            fs_id,
-            security_credentials,
-            ap_id,
-            client_info,
-            base_path=state_file_dir,
-        )
-        cert_details["certificate"] = os.path.join(
-            state_file_dir, cert_details["mountStateDir"], "certificate.pem"
-        )
-        cert_details["privateKey"] = get_private_key_path()
-        cert_details["fsId"] = fs_id
+            # Access points must be mounted over TLS
+            if ap_id:
+                cert_details["accessPoint"] = ap_id
+
+            # additional symbol appended to avoid naming collisions
+            cert_details["mountStateDir"] = (
+                get_mount_specific_filename(fs_id, mountpoint, proxy_listen_port) + "+"
+            )
+            # common name for certificate signing request is max 64 characters
+            cert_details["commonName"] = socket.gethostname()[0:64]
+            cert_details["region"] = region
+            cert_details["certificateCreationTime"] = create_certificate(
+                config,
+                cert_details["mountStateDir"],
+                cert_details["commonName"],
+                cert_details["region"],
+                fs_id,
+                security_credentials,
+                ap_id,
+                client_info,
+                base_path=state_file_dir,
+            )
+            cert_details["certificate"] = os.path.join(
+                state_file_dir, cert_details["mountStateDir"], "certificate.pem"
+            )
+            cert_details["privateKey"] = get_private_key_path()
+            cert_details["fsId"] = fs_id
 
         if not os.path.exists(state_file_dir):
             create_required_directory(config, state_file_dir)
 
         start_watchdog(init_system)
 
-        verify_level = int(options.get("verify", DEFAULT_STUNNEL_VERIFY_LEVEL))
+        verify_level = (
+            int(options.get("verify", DEFAULT_STUNNEL_VERIFY_LEVEL))
+            if tls_enabled(options)
+            else None
+        )
+
         ocsp_enabled = is_ocsp_enabled(config, options)
+        if ocsp_enabled:
+            assert (
+                not efs_proxy_enabled
+            ), "OCSP is not supported by efs-proxy, and efs-utils failed to revert to stunnel-mode."
 
         stunnel_config_file = write_stunnel_config_file(
             config,
             state_file_dir,
             fs_id,
             mountpoint,
-            tls_port,
+            proxy_listen_port,
             dns_name,
             verify_level,
             ocsp_enabled,
@@ -1738,16 +1952,31 @@ def bootstrap_tls(
             region,
             cert_details=cert_details,
             fallback_ip_address=fallback_ip_address,
+            efs_proxy_enabled=efs_proxy_enabled,
         )
-        tunnel_args = [_stunnel_bin(), stunnel_config_file]
+        if efs_proxy_enabled:
+            if "tls" in options:
+                tunnel_args = [
+                    _efs_proxy_bin(),
+                    stunnel_config_file,
+                    EFS_PROXY_TLS_OPTION,
+                ]
+            else:
+                tunnel_args = [
+                    _efs_proxy_bin(),
+                    stunnel_config_file,
+                ]
+        else:
+            tunnel_args = [_stunnel_bin(), stunnel_config_file]
+
         if "netns" in options:
             tunnel_args = ["nsenter", "--net=" + options["netns"]] + tunnel_args
 
         # This temp state file is acting like a tlsport lock file, which is why pid =- 1
-        temp_tls_state_file = write_tls_tunnel_state_file(
+        temp_tls_state_file = write_tunnel_state_file(
             fs_id,
             mountpoint,
-            tls_port,
+            proxy_listen_port,
             -1,
             tunnel_args,
             [stunnel_config_file],
@@ -1755,13 +1984,21 @@ def bootstrap_tls(
             cert_details=cert_details,
         )
     finally:
-        # Always close the socket we created when choosing TLS port only until now to
-        # 1. avoid concurrent TLS mount port collision 2. enable stunnel process to bind the port
-        logging.debug("Closing socket used to choose TLS port %s.", tls_port)
-        tls_port_sock.close()
+        # When choosing a TLS port for efs-proxy/stunnel to listen on, we open the port to ensure it is free.
+        # However, we must free it again so efs-proxy/stunnel can bind to it. We make sure to only free it after
+        # we write the temporary state file, which acts like a tlsport lock file. This ensures we don't encounter
+        # any race conditions when choosing tls ports during concurrent mounts.
+        logging.debug(
+            "Closing socket used to choose proxy listen port %s.", proxy_listen_port
+        )
+        proxy_listen_sock.close()
 
     # launch the tunnel in a process group so if it has any child processes, they can be killed easily by the mount watchdog
-    logging.info('Starting TLS tunnel: "%s"', " ".join(tunnel_args))
+    logging.info(
+        'Starting %s: "%s"',
+        "efs-proxy" if efs_proxy_enabled else "stunnel",
+        " ".join(tunnel_args),
+    )
     tunnel_proc = subprocess.Popen(
         tunnel_args,
         stdout=subprocess.DEVNULL,
@@ -1769,21 +2006,27 @@ def bootstrap_tls(
         preexec_fn=os.setsid,
         close_fds=True,
     )
-    logging.info("Started TLS tunnel, pid: %d", tunnel_proc.pid)
-
-    update_tls_tunnel_temp_state_file_with_tunnel_pid(
-        temp_tls_state_file, state_file_dir, tunnel_proc.pid
-    )
-
-    if "netns" not in options:
-        test_tlsport(options["tlsport"])
-    else:
-        with NetNS(nspath=options["netns"]):
-            test_tlsport(options["tlsport"])
 
     try:
+        logging.info(
+            "Started %s, pid: %d",
+            "efs-proxy" if efs_proxy_enabled else "stunnel",
+            tunnel_proc.pid,
+        )
+
+        update_tunnel_temp_state_file_with_tunnel_pid(
+            temp_tls_state_file, state_file_dir, tunnel_proc.pid
+        )
+
+        if "netns" not in options:
+            test_tlsport(options["tlsport"])
+        else:
+            with NetNS(nspath=options["netns"]):
+                test_tlsport(options["tlsport"])
         yield tunnel_proc
     finally:
+        # The caller of this function should use this function in the context of a `with` statement
+        # so that the state file is correctly renamed.
         os.rename(
             os.path.join(state_file_dir, temp_tls_state_file),
             os.path.join(state_file_dir, temp_tls_state_file[1:]),
@@ -1813,7 +2056,20 @@ def check_if_nfsvers_is_compatible_with_macos(options):
         fatal_error("NFSv4.1 is not supported on MacOS, please switch to NFSv4.0")
 
 
-def get_nfs_mount_options(options):
+# Use stunnel instead of efs-proxy for tls mounts,
+# and attach non-tls mounts directly to the mount target.
+def legacy_stunnel_mode_enabled(options, config):
+    # OpenShift CARRY: Enable stunnel for all connections
+    return True
+
+    # return (
+        # LEGACY_STUNNEL_MOUNT_OPTION in options
+        # or check_if_platform_is_mac()
+        # or is_ocsp_enabled(config, options)
+    # )
+
+
+def get_nfs_mount_options(options, config):
     # If you change these options, update the man page as well at man/mount.efs.8
     if "nfsvers" not in options and "vers" not in options:
         options["nfsvers"] = "4.1" if not check_if_platform_is_mac() else "4.0"
@@ -1838,7 +2094,11 @@ def get_nfs_mount_options(options):
     if check_if_platform_is_mac():
         options["mountport"] = "2049"
 
-    if "tls" in options:
+    if legacy_stunnel_mode_enabled(options, config):
+        # Non-tls mounts in stunnel mode should not re-map the port
+        if "tls" in options:
+            options["port"] = options["tlsport"]
+    else:
         options["port"] = options["tlsport"]
 
     def to_nfs_option(k, v):
@@ -1853,13 +2113,29 @@ def get_nfs_mount_options(options):
     return ",".join(nfs_options)
 
 
+def get_ipv6_addresses(hostname):
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None, socket.AF_INET6)
+        return [addr[4][0] for addr in addrinfo]
+    except socket.gaierror:
+        return []
+
+
 def mount_nfs(config, dns_name, path, mountpoint, options, fallback_ip_address=None):
-    if "tls" in options:
-        mount_path = "127.0.0.1:%s" % path
-    elif fallback_ip_address:
-        mount_path = "%s:%s" % (fallback_ip_address, path)
+    if legacy_stunnel_mode_enabled(options, config):
+        if "tls" in options:
+            mount_path = "127.0.0.1:%s" % path
+        elif fallback_ip_address:
+            if is_ipv6_address(fallback_ip_address):
+                mount_path = f"[{fallback_ip_address}]:{path}"
+            else:
+                mount_path = "%s:%s" % (fallback_ip_address, path)
+        else:
+            mount_path = "%s:%s" % (dns_name, path)
     else:
-        mount_path = "%s:%s" % (dns_name, path)
+        mount_path = "127.0.0.1:%s" % path
+
+    nfs_options = get_nfs_mount_options(options, config)
 
     if not check_if_platform_is_mac():
         command = [
@@ -1867,13 +2143,13 @@ def mount_nfs(config, dns_name, path, mountpoint, options, fallback_ip_address=N
             mount_path,
             mountpoint,
             "-o",
-            get_nfs_mount_options(options),
+            nfs_options,
         ]
     else:
         command = [
             "/sbin/mount_nfs",
             "-o",
-            get_nfs_mount_options(options),
+            nfs_options,
             mount_path,
             mountpoint,
         ]
@@ -1955,9 +2231,15 @@ def call_nfs_mount_command_with_retry_succeed(
             out, err = proc.communicate(timeout=retry_nfs_mount_command_timeout_sec)
             rc = proc.poll()
             if rc != 0:
+                is_access_point_mount = "accesspoint" in options
                 continue_retry = any(
                     error_string in str(err) for error_string in RETRYABLE_ERRORS
                 )
+
+                # Only retry "access denied" for access point mounts, handles race condition that can occur during AP backend provisioning
+                if not continue_retry and "access denied by server" in str(err):
+                    continue_retry = is_access_point_mount
+
                 if continue_retry:
                     logging.error(
                         'Mounting %s to %s failed, return code=%s, stdout="%s", stderr="%s", mount attempt %d/%d, '
@@ -2430,7 +2712,7 @@ def get_utc_now():
     """
     Wrapped for patching purposes in unit tests
     """
-    return datetime.utcnow()
+    return datetime.now(timezone.utc)
 
 
 def assert_root():
@@ -2448,7 +2730,8 @@ def read_config(config_file=CONFIG_FILE):
     return p
 
 
-def bootstrap_logging(config, log_dir=LOG_DIR):
+# Retrieve and parse the logging level from the config file.
+def get_log_level_from_config(config):
     raw_level = config.get(CONFIG_SECTION, "logging_level")
     levels = {
         "debug": logging.DEBUG,
@@ -2464,6 +2747,26 @@ def bootstrap_logging(config, log_dir=LOG_DIR):
         # delay logging error about malformed log level until after logging is configured
         level_error = True
         level = logging.INFO
+
+    return (level, raw_level, level_error)
+
+
+# Convert the log level provided in the config into a log level string
+# that is understandable by efs-proxy
+def get_efs_proxy_log_level(config):
+    level, raw_level, level_error = get_log_level_from_config(config)
+    if level_error:
+        return "info"
+
+    # Efs-proxy does not have a CRITICAL log level
+    if level == logging.CRITICAL:
+        return "error"
+
+    return raw_level.lower()
+
+
+def bootstrap_logging(config, log_dir=LOG_DIR):
+    level, raw_level, level_error = get_log_level_from_config(config)
 
     max_bytes = config.getint(CONFIG_SECTION, "logging_max_bytes")
     file_count = config.getint(CONFIG_SECTION, "logging_file_count")
@@ -2501,8 +2804,9 @@ def get_dns_name_and_fallback_mount_target_ip_address(config, fs_id, options):
     if options and "crossaccount" in options:
         try:
             az_id = get_az_id_from_instance_metadata(config, options)
-            region = get_target_region(config)
-            dns_name = "%s.%s.efs.%s.amazonaws.com" % (az_id, fs_id, region)
+            region = get_target_region(config, options)
+            dns_name_suffix = get_dns_name_suffix(config, region)
+            dns_name = "%s.%s.efs.%s.%s" % (az_id, fs_id, region, dns_name_suffix)
         except RuntimeError:
             err_msg = "Cannot retrieve AZ-ID from metadata service. This is required for the crossaccount mount option."
             fatal_error(err_msg)
@@ -2524,27 +2828,18 @@ def get_dns_name_and_fallback_mount_target_ip_address(config, fs_id, options):
             else:
                 dns_name_format = dns_name_format.replace("{az}.", "")
 
+        region = None
         if "{region}" in dns_name_format:
+            region = get_target_region(config, options)
             expected_replacement_field_ct += 1
-            format_args["region"] = get_target_region(config)
+            format_args["region"] = region
 
         if "{dns_name_suffix}" in dns_name_format:
             expected_replacement_field_ct += 1
-            config_section = CONFIG_SECTION
-            region = format_args.get("region")
-
-            if region:
-                config_section = get_config_section(config, region)
-
-            format_args["dns_name_suffix"] = config.get(
-                config_section, "dns_name_suffix"
-            )
-
-            logging.debug(
-                "Using dns_name_suffix %s in config section [%s]",
-                format_args.get("dns_name_suffix"),
-                config_section,
-            )
+            region = region or get_target_region(config, options)
+            dns_name_suffix = get_dns_name_suffix(config, region)
+            format_args["dns_name_suffix"] = dns_name_suffix
+            logging.debug("Using dns_name_suffix %s", dns_name_suffix)
 
         _validate_replacement_field_count(
             dns_name_format, expected_replacement_field_ct
@@ -2663,8 +2958,8 @@ def check_and_remove_lock_file(path, file):
 
 def dns_name_can_be_resolved(dns_name):
     try:
-        socket.gethostbyname(dns_name)
-        return True
+        addr_info = socket.getaddrinfo(dns_name, None, socket.AF_UNSPEC)
+        return len(addr_info) > 0
     except socket.gaierror:
         return False
 
@@ -2720,10 +3015,11 @@ def get_fallback_mount_target_ip_address_helper(config, options, fs_id):
     efs_client = get_botocore_client(config, "efs", options)
 
     mount_target = get_mount_target_in_az(efs_client, ec2_client, fs_id, az_name)
-    mount_target_ip = mount_target.get("IpAddress")
-    logging.debug("Found mount target ip address %s in AZ %s", mount_target_ip, az_name)
 
-    return mount_target_ip
+    if "IpAddress" in mount_target:
+        return mount_target.get("IpAddress")
+    elif "Ipv6Address" in mount_target:
+        return mount_target.get("Ipv6Address")
 
 
 def throw_dns_resolve_failure_with_fallback_message(dns_name, fallback_message=None):
@@ -2941,8 +3237,18 @@ def match_device(config, device, options):
         return remote, path, None
 
     try:
-        primary, secondaries, _ = socket.gethostbyname_ex(remote)
-        hostnames = list(filter(lambda e: e is not None, [primary] + secondaries))
+        addrinfo = socket.getaddrinfo(
+            remote, None, socket.AF_UNSPEC, socket.SOCK_STREAM, 0, socket.AI_CANONNAME
+        )
+        hostnames = list(
+            set(
+                filter(
+                    lambda e: e is not None and e != "", [info[3] for info in addrinfo]
+                )
+            )
+        )
+        if not hostnames:
+            hostnames = [remote]
     except socket.gaierror:
         create_default_cloudwatchlog_agent_if_not_exist(config, options)
         fatal_error(
@@ -3023,7 +3329,7 @@ def is_nfs_mount(mountpoint):
         return False
 
 
-def mount_tls(
+def mount_with_proxy(
     config,
     init_system,
     dns_name,
@@ -3033,6 +3339,11 @@ def mount_tls(
     options,
     fallback_ip_address=None,
 ):
+    """
+    This function is responsible for launching a efs-proxy process and attaching a NFS mount to that process
+    over the loopback interface. Efs-proxy is responsible for forwarding NFS operations to EFS.
+    When the legacy 'stunnel' mount option is used, this function will launch a stunnel process instead of efs-proxy.
+    """
     if os.path.ismount(mountpoint) and is_nfs_mount(mountpoint):
         sys.stdout.write(
             "%s is already mounted, please run 'mount' command to verify\n" % mountpoint
@@ -3040,7 +3351,10 @@ def mount_tls(
         logging.warning("%s is already mounted, mount aborted" % mountpoint)
         return
 
-    with bootstrap_tls(
+    efs_proxy_enabled = not legacy_stunnel_mode_enabled(options, config)
+    logging.debug("mount_with_proxy: efs_proxy_enabled = %s", efs_proxy_enabled)
+
+    with bootstrap_proxy(
         config,
         init_system,
         dns_name,
@@ -3048,6 +3362,7 @@ def mount_tls(
         mountpoint,
         options,
         fallback_ip_address=fallback_ip_address,
+        efs_proxy_enabled=efs_proxy_enabled,
     ) as tunnel_proc:
         mount_completed = threading.Event()
         t = threading.Thread(
@@ -3070,7 +3385,8 @@ def verify_tlsport_can_be_connected(tlsport):
         logging.debug("Trying to connect to 127.0.0.1: %s", tlsport)
         test_socket.connect(("127.0.0.1", tlsport))
         return True
-    except ConnectionRefusedError:
+    except Exception as e:
+        logging.warning("Error connecting to 127.0.0.1:%s, %s", tlsport, e)
         return False
     finally:
         test_socket.close()
@@ -3210,7 +3526,7 @@ def get_botocore_client(config, service, options):
         botocore_config = botocore.config.Config(use_fips_endpoint=True)
 
     session = botocore.session.get_session()
-    region = get_target_region(config)
+    region = get_target_region(config, options)
 
     if options and options.get("awsprofile"):
         profile = options.get("awsprofile")
@@ -3246,7 +3562,7 @@ def get_cloudwatchlog_config(config, fs_id=None):
                 )
 
     logging.debug("Pushing logs to log group named %s in Cloudwatch.", log_group_name)
-    retention_days = DEFAULT_RETENTION_DAYS
+    retention_days = None
     if config.has_option(CLOUDWATCH_LOG_SECTION, "retention_in_days"):
         retention_days = config.get(CLOUDWATCH_LOG_SECTION, "retention_in_days")
 
@@ -3254,7 +3570,7 @@ def get_cloudwatchlog_config(config, fs_id=None):
 
     return {
         "log_group_name": log_group_name,
-        "retention_days": int(retention_days),
+        "retention_days": None if retention_days is None else int(retention_days),
         "log_stream_name": log_stream_name,
     }
 
@@ -3351,10 +3667,13 @@ def create_cloudwatch_log_group(cloudwatchlog_client, log_group_name):
 def cloudwatch_put_retention_policy_helper(
     cloudwatchlog_client, log_group_name, retention_days
 ):
-    cloudwatchlog_client.put_retention_policy(
-        logGroupName=log_group_name, retentionInDays=retention_days
-    )
-    logging.debug("Set cloudwatch log group retention days to %s" % retention_days)
+    if retention_days is not None:
+        cloudwatchlog_client.put_retention_policy(
+            logGroupName=log_group_name, retentionInDays=retention_days
+        )
+        logging.debug("Set cloudwatch log group retention days to %s" % retention_days)
+    else:
+        cloudwatchlog_client.delete_retention_policy(logGroupName=log_group_name)
 
 
 def put_cloudwatch_log_retention_policy(
@@ -3794,6 +4113,7 @@ def optimize_readahead_window(mountpoint, options, config):
         DEFAULT_NFS_MAX_READAHEAD_MULTIPLIER * int(options["rsize"]) / 1024
     )
 
+    system_release_version = get_system_release_version()
     try:
         major, minor = decode_device_number(os.stat(mountpoint).st_dev)
         # modify read_ahead_kb in /sys/class/bdi/<bdi>/read_ahead_kb
@@ -3806,6 +4126,20 @@ def optimize_readahead_window(mountpoint, options, config):
             read_ahead_kb_config_file,
             str(fixed_readahead_kb),
         )
+        if UBUNTU_24_RELEASE in system_release_version:
+            # For Ubuntu 24, we use a delayed approach to setting the readahead value.
+            # This is necessary because on Ubuntu 24, there's a race condition with udev
+            # rules that can reset our readahead value immediately after we set it.
+            p = subprocess.Popen(
+                "sleep 2 && echo %s > %s"
+                % (fixed_readahead_kb, read_ahead_kb_config_file),
+                shell=True,
+                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+            )
+            logging.debug("Started background thread for delayed readahead setting")
+            return
+
         p = subprocess.Popen(
             "echo %s > %s" % (fixed_readahead_kb, read_ahead_kb_config_file),
             shell=True,
@@ -3907,22 +4241,22 @@ def main():
     if check_if_platform_is_mac() and "notls" not in options:
         options["tls"] = None
 
-    if "tls" in options:
-        mount_tls(
+    if "tls" not in options and legacy_stunnel_mode_enabled(options, config):
+        mount_nfs(
             config,
-            init_system,
             dns_name,
             path,
-            fs_id,
             mountpoint,
             options,
             fallback_ip_address=fallback_ip_address,
         )
     else:
-        mount_nfs(
+        mount_with_proxy(
             config,
+            init_system,
             dns_name,
             path,
+            fs_id,
             mountpoint,
             options,
             fallback_ip_address=fallback_ip_address,
