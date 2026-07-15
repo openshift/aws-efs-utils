@@ -523,11 +523,8 @@ def get_config_section(config, region):
 
 
 def legacy_stunnel_mode_enabled(options, config):
-    context = MountContext()
-    if context.proxy_mode == "stunnel":
-        return True
-    else:
-        return False
+    # OpenShift CARRY: Enable stunnel for all connections
+    return True
 
 
 def get_fips_config(config):
