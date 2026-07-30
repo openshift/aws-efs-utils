@@ -1,7 +1,9 @@
-# Dockefile for OpenShift base image named "aws-efs-utils-base"
+# Dockerfile for OpenShift base image named "aws-efs-utils-base"
 #
 # The image contains:
 # - /sbin/mount.efs
+# - /sbin/efs_utils_common/*
+# - /sbin/mount_efs/*
 # - /usr/bin/amazon-efs-mount-watchdog
 # - /etc/amazon/*
 # - /var/log/amazon/efs/*
@@ -20,6 +22,8 @@ COPY ./dist/efs-utils.conf /etc/amazon/efs/efs-utils.conf
 RUN chmod 444 /etc/amazon/efs/efs-utils.conf
 COPY ./src/mount_efs/__init__.py /sbin/mount.efs
 RUN chmod 755 /sbin/mount.efs
+COPY ./src/efs_utils_common /sbin/efs_utils_common
+COPY ./src/mount_efs /sbin/mount_efs
 COPY ./src/watchdog/__init__.py /usr/bin/amazon-efs-mount-watchdog
 RUN chmod 755 /usr/bin/amazon-efs-mount-watchdog
 
@@ -33,3 +37,14 @@ COPY "$REMOTE_SOURCES_SRC" "$REMOTE_SOURCES_DST"
 # Install python dependencies (i.e. botocore).
 COPY requirements.txt.ocp install-python-deps-ocp.sh /src/
 RUN /src/install-python-deps-ocp.sh
+
+# Verify that all installed libraries can be imported
+# These import exists to fail image creation if one or more
+# libraries can't be imported for some reason.
+RUN PYTHONPATH=/sbin python3 - <<'PY'
+import efs_utils_common.cloudwatch
+import efs_utils_common.config_utils
+import mount_efs.dns_resolver
+PY
+
+RUN /sbin/mount.efs --version

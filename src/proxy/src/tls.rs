@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use log::*;
-use nix::NixPath;
 use s2n_tls::enums::ClientAuthType::Optional;
 use s2n_tls::security::Policy;
 use s2n_tls::{config::Config, security::DEFAULT_TLS13};
@@ -96,7 +95,7 @@ impl TlsConfig {
         server_domain: &str,
     ) -> Result<Self> {
         let mut ca_file_contents: Vec<u8> = Vec::new();
-        if !ca_file.is_empty() {
+        if !ca_file.as_os_str().is_empty() {
             ca_file_contents = read_file_with_comments_removed(ca_file).await.context(
                 String::from("Error in TlsConfig::new. Unable to the CA File. Make sure it does not have any comments (lines that start with #)."))?;
         }

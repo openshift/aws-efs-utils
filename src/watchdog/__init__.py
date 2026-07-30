@@ -56,8 +56,9 @@ AMAZON_LINUX_2_RELEASE_VERSIONS = [
     AMAZON_LINUX_2_RELEASE_ID,
     AMAZON_LINUX_2_PRETTY_NAME,
 ]
-VERSION = "2.4.2"
+VERSION = "3.2.0"
 SERVICE = "elasticfilesystem"
+FS_PREFIX = "fs-"
 
 CONFIG_FILE = "/etc/amazon/efs/efs-utils.conf"
 CONFIG_SECTION = "mount-watchdog"
@@ -77,6 +78,7 @@ STATE_FILE_DIR = "/var/run/efs"
 STUNNEL_PID_FILE = "stunnel.pid"
 
 DEFAULT_NFS_PORT = "2049"
+EFS_SERVICE_NAME = "elasticfilesystem"
 PRIVATE_KEY_FILE = "/etc/amazon/efs/privateKey.pem"
 DEFAULT_REFRESH_SELF_SIGNED_CERT_INTERVAL_MIN = 60
 DEFAULT_STUNNEL_HEALTH_CHECK_INTERVAL_MIN = 5
@@ -143,7 +145,7 @@ CANONICAL_HEADERS = "\n".join(
 SIGNED_HEADERS = ";".join(CANONICAL_HEADERS_DICT.keys())
 REQUEST_PAYLOAD = ""
 
-AP_ID_RE = re.compile("^fsap-[0-9a-f]{17}$")
+AP_ID_RE = re.compile("^(?:fsap)-[0-9a-f]{17}$")
 
 ECS_TASK_METADATA_API = "http://169.254.170.2"
 STS_ENDPOINT_URL_FORMAT = "https://sts.{}.{}/"
@@ -479,7 +481,13 @@ def get_aws_security_credentials_from_webidentity(config, role_arn, token_file, 
 
 
 def get_sts_endpoint_url(config, region):
+    # The dns_name_suffix from config may be an S3 Files "on.*" domain that
+    # doesn't match the STS endpoint domain. Map to the correct STS domain.
     dns_name_suffix = get_dns_name_suffix(config, region)
+    if dns_name_suffix == "on.aws":
+        dns_name_suffix = "amazonaws.com"
+    elif dns_name_suffix == "on.amazonwebservices.com.cn":
+        dns_name_suffix = "amazonaws.com.cn"
     return STS_ENDPOINT_URL_FORMAT.format(region, dns_name_suffix)
 
 
@@ -710,10 +718,18 @@ def parse_options(options):
     return opts
 
 
+def get_file_safe_mountpoint_name(mountpoint):
+    """Convert a mount path to a dot-separated, filename-safe string.
+
+    This is a local copy of efs_utils_common.file_utils.get_file_safe_mountpoint_name().
+    The watchdog cannot import from efs_utils_common due to its install location.
+    Both copies must stay in sync — see https://github.com/aws/efs-utils/issues/218.
+    """
+    return os.path.abspath(mountpoint).replace(os.sep, ".").lstrip(".")
+
+
 def get_file_safe_mountpoint(mount):
-    mountpoint = os.path.abspath(mount.mountpoint).replace(os.sep, ".")
-    if mountpoint.startswith("."):
-        mountpoint = mountpoint[1:]
+    mountpoint = get_file_safe_mountpoint_name(mount.mountpoint)
 
     opts = parse_options(mount.options)
     if "port" not in opts:
@@ -848,7 +864,7 @@ def get_state_files(state_file_dir):
 
     if os.path.isdir(state_file_dir):
         for sf in os.listdir(state_file_dir):
-            if not sf.startswith("fs-") or os.path.isdir(
+            if not sf.startswith(FS_PREFIX) or os.path.isdir(
                 os.path.join(state_file_dir, sf)
             ):
                 continue
@@ -974,8 +990,10 @@ def get_system_release_version():
     try:
         with open(OS_RELEASE_PATH) as f:
             for line in f:
-                if "PRETTY_NAME" in line:
-                    return line.split("=")[1].strip()
+                line = line.strip()
+                if line.startswith("PRETTY_NAME="):
+                    value = line.split("=", 1)[1].strip()
+                    return value.strip('"').strip("'")
     except IOError:
         logging.debug("Unable to read %s", OS_RELEASE_PATH)
 
@@ -1244,6 +1262,9 @@ def check_efs_mounts(
                 logging.exception("Unable to parse json in %s", state_file_path)
                 continue
 
+        # Get service type from JSON, default to EFS for backwards compatibility
+        service = state.get("service_type", EFS_SERVICE_NAME)
+
         current_time = time.time()
         if "unmount_time" in state:
             if state["unmount_time"] + unmount_grace_period_sec < current_time:
@@ -1278,7 +1299,7 @@ def check_efs_mounts(
             rewrite_state_file(state, state_file_dir, state_file)
 
             if "certificate" in state:
-                check_certificate(config, state, state_file_dir, state_file)
+                check_certificate(config, state, state_file_dir, state_file, service)
 
             if is_mount_stunnel_proc_running(
                 state.get("pid"), state_file, state_file_dir
@@ -1586,7 +1607,7 @@ def read_config(config_file=CONFIG_FILE):
 
 
 def check_certificate(
-    config, state, state_file_dir, state_file, base_path=STATE_FILE_DIR
+    config, state, state_file_dir, state_file, service, base_path=STATE_FILE_DIR
 ):
     certificate_creation_time = datetime.strptime(
         state["certificateCreationTime"], CERT_DATETIME_FORMAT
@@ -1630,6 +1651,7 @@ def check_certificate(
         credentials_source,
         ap_state,
         state["region"],
+        service,
         base_path=base_path,
     )
     if updated_certificate_creation_time:
@@ -1728,6 +1750,7 @@ def recreate_certificate(
     credentials_source,
     ap_id,
     region,
+    service,
     base_path=STATE_FILE_DIR,
 ):
     current_time = get_utc_now()
@@ -1762,6 +1785,7 @@ def recreate_certificate(
         region,
         fs_id,
         credentials_source,
+        service,
         ap_id=ap_id,
         client_info=client_info,
     )
@@ -1878,6 +1902,7 @@ def create_ca_conf(
     region,
     fs_id,
     credentials_source,
+    service,
     ap_id=None,
     client_info=None,
 ):
@@ -1907,6 +1932,7 @@ def create_ca_conf(
             date,
             region,
             fs_id,
+            service,
             security_credentials["Token"],
         )
         if credentials_source
@@ -1955,6 +1981,7 @@ def efs_client_auth_builder(
     date,
     region,
     fs_id,
+    service,
     session_token=None,
 ):
     public_key_hash = get_public_key_sha1(public_key_path)
@@ -1963,10 +1990,12 @@ def efs_client_auth_builder(
         return None
 
     canonical_request = create_canonical_request(
-        public_key_hash, date, access_key_id, region, fs_id, session_token
+        public_key_hash, date, access_key_id, region, fs_id, service, session_token
     )
-    string_to_sign = create_string_to_sign(canonical_request, date, region)
-    signature = calculate_signature(string_to_sign, date, secret_access_key, region)
+    string_to_sign = create_string_to_sign(canonical_request, date, region, service)
+    signature = calculate_signature(
+        string_to_sign, date, secret_access_key, region, service
+    )
     efs_client_auth_str = "[ efs_client_auth ]"
     efs_client_auth_str += "\naccessKeyId = UTF8String:" + access_key_id
     efs_client_auth_str += "\nsignature = OCTETSTRING:" + signature
@@ -2123,13 +2152,15 @@ def get_public_key_sha1(public_key):
 
 
 def create_canonical_request(
-    public_key_hash, date, access_key, region, fs_id, session_token=None
+    public_key_hash, date, access_key, region, fs_id, service, session_token=None
 ):
     """
     Create a Canonical Request - https://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html
     """
     formatted_datetime = date.strftime(SIGV4_DATETIME_FORMAT)
-    credential = quote_plus(access_key + "/" + get_credential_scope(date, region))
+    credential = quote_plus(
+        access_key + "/" + get_credential_scope(date, region, service)
+    )
 
     request = HTTP_REQUEST_METHOD + "\n"
     request += CANONICAL_URI + "\n"
@@ -2172,13 +2203,13 @@ def create_canonical_query_string(
     )
 
 
-def create_string_to_sign(canonical_request, date, region):
+def create_string_to_sign(canonical_request, date, region, service):
     """
     Create a String to Sign - https://docs.aws.amazon.com/general/latest/gr/sigv4-create-string-to-sign.html
     """
     string_to_sign = ALGORITHM + "\n"
     string_to_sign += date.strftime(SIGV4_DATETIME_FORMAT) + "\n"
-    string_to_sign += get_credential_scope(date, region) + "\n"
+    string_to_sign += get_credential_scope(date, region, service) + "\n"
 
     sha256 = hashlib.sha256()
     sha256.update(canonical_request.encode())
@@ -2187,7 +2218,7 @@ def create_string_to_sign(canonical_request, date, region):
     return string_to_sign
 
 
-def calculate_signature(string_to_sign, date, secret_access_key, region):
+def calculate_signature(string_to_sign, date, secret_access_key, region, service):
     """
     Calculate the Signature - https://docs.aws.amazon.com/general/latest/gr/sigv4-calculate-signature.html
     """
@@ -2199,7 +2230,7 @@ def calculate_signature(string_to_sign, date, secret_access_key, region):
         ("AWS4" + secret_access_key).encode("utf-8"), date.strftime(DATE_ONLY_FORMAT)
     ).digest()
     add_region = _sign(key_date, region).digest()
-    add_service = _sign(add_region, SERVICE).digest()
+    add_service = _sign(add_region, service).digest()
     signing_key = _sign(add_service, "aws4_request").digest()
 
     return _sign(signing_key, string_to_sign).hexdigest()
@@ -2236,8 +2267,8 @@ def get_certificate_renewal_interval_mins(config):
     return interval
 
 
-def get_credential_scope(date, region):
-    return "/".join([date.strftime(DATE_ONLY_FORMAT), region, SERVICE, AWS4_REQUEST])
+def get_credential_scope(date, region, service):
+    return "/".join([date.strftime(DATE_ONLY_FORMAT), region, service, AWS4_REQUEST])
 
 
 def get_certificate_timestamp(current_time, **kwargs):
@@ -2281,7 +2312,7 @@ def check_and_remove_file(path):
 
 def check_and_remove_lock_file(path, file):
     """
-    There is a possibility of having a race condition as the lock file is getting deleted in both mount_efs and watchdog,
+    There is a possibility of having a race condition as the lock file is getting deleted in both efs_utils_common and watchdog,
     so creating a function in order to check whether the path exist or not before removing the lock file.
     """
     try:
