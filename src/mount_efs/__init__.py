@@ -194,7 +194,7 @@ AP_ID_RE = re.compile("^fsap-[0-9a-f]{17}$")
 
 CREDENTIALS_KEYS = ["AccessKeyId", "SecretAccessKey", "Token"]
 ECS_TASK_METADATA_API = "http://169.254.170.2"
-STS_ENDPOINT_URL_FORMAT = "https://sts.{}.amazonaws.com/"
+STS_ENDPOINT_URL_FORMAT = "https://sts.{}.{}/"
 INSTANCE_METADATA_TOKEN_URL = "http://169.254.169.254/latest/api/token"
 INSTANCE_METADATA_SERVICE_URL = (
     "http://169.254.169.254/latest/dynamic/instance-identity/document/"
@@ -794,7 +794,7 @@ def get_aws_security_credentials_from_webidentity(
         else:
             return None, None
 
-    STS_ENDPOINT_URL = STS_ENDPOINT_URL_FORMAT.format(region)
+    STS_ENDPOINT_URL = get_sts_endpoint_url(config, region)
     webidentity_url = (
         STS_ENDPOINT_URL
         + "?"
@@ -842,6 +842,14 @@ def get_aws_security_credentials_from_webidentity(
         fatal_error(unsuccessful_resp, unsuccessful_resp)
     else:
         return None, None
+
+
+def get_sts_endpoint_url(config, region):
+    config_section = "%s.%s" % (CONFIG_SECTION, region)
+    if not config.has_option(config_section, "dns_name_suffix"):
+        config_section = CONFIG_SECTION
+    dns_name_suffix = config.get(config_section, "dns_name_suffix")
+    return STS_ENDPOINT_URL_FORMAT.format(region, dns_name_suffix)
 
 
 def get_aws_security_credentials_from_instance_metadata(config, iam_role_name):
