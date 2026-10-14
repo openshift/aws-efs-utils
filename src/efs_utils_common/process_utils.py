@@ -99,7 +99,7 @@ def subprocess_call(cmd, error_message):
         process = subprocess.Popen(
             cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True
         )
-        (output, err) = process.communicate()
+        output, err = process.communicate()
         rc = process.poll()
         if rc != 0:
             logging.error(

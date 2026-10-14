@@ -11,7 +11,7 @@ import os
 import pwd
 import re
 
-VERSION = "3.2.0"
+VERSION = "3.3.2"
 
 AMAZON_LINUX_2_RELEASE_ID = "Amazon Linux release 2 (Karoo)"
 AMAZON_LINUX_2_PRETTY_NAME = "Amazon Linux 2"
@@ -42,6 +42,8 @@ DEFAULT_GET_AWS_EC2_METADATA_TOKEN_RETRY_COUNT = 3
 DEFAULT_NFS_MOUNT_COMMAND_RETRY_COUNT = 3
 DEFAULT_NFS_MOUNT_COMMAND_TIMEOUT_SEC = 15
 DISABLE_FETCH_EC2_METADATA_TOKEN_ITEM = "disable_fetch_ec2_metadata_token"
+URL_REQUEST_TIMEOUT_ITEM = "url_request_timeout_sec"
+DEFAULT_URL_REQUEST_TIMEOUT_SEC = 1
 FALLBACK_TO_MOUNT_TARGET_IP_ADDRESS_ITEM = (
     "fall_back_to_mount_target_ip_address_enabled"
 )
@@ -109,6 +111,8 @@ DEFAULT_STUNNEL_CAFILE = "/etc/amazon/efs/efs-utils.crt"
 
 LEGACY_STUNNEL_MOUNT_OPTION = "stunnel"
 
+NFS_MOUNT_OPTION = "nfs"
+
 NOT_BEFORE_MINS = 15
 NOT_AFTER_HOURS = 3
 
@@ -136,6 +140,7 @@ NON_NFS_OPTIONS = [
     "jwtpath",
     "crossaccount",
     LEGACY_STUNNEL_MOUNT_OPTION,
+    NFS_MOUNT_OPTION,
     "nodirects3read",
     "nos3readcache",
 ]
@@ -144,7 +149,7 @@ UNSUPPORTED_OPTIONS = ["capath"]
 
 WATCHDOG_SERVICE = "amazon-efs-mount-watchdog"
 # MacOS instances use plist files. This files needs to be loaded on launchctl (init system of MacOS)
-WATCHDOG_SERVICE_PLIST_PATH = "/Library/LaunchAgents/amazon-efs-mount-watchdog.plist"
+WATCHDOG_SERVICE_PLIST_PATH = "/Library/LaunchDaemons/amazon-efs-mount-watchdog.plist"
 SYSTEM_RELEASE_PATH = "/etc/system-release"
 OS_RELEASE_PATH = "/etc/os-release"
 MACOS_BIG_SUR_RELEASE = "macOS-11"
@@ -186,8 +191,6 @@ ECS_FARGATE_CLIENT_IDENTIFIER = "ecs.fargate"
 
 AWS_CONTAINER_CREDS_FULL_URI_ENV = "AWS_CONTAINER_CREDENTIALS_FULL_URI"
 AWS_CONTAINER_AUTH_TOKEN_FILE_ENV = "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
-
-UBUNTU_24_RELEASE = "Ubuntu 24"
 
 MOUNT_TYPE_EFS = "EFS"
 MOUNT_TYPE_S3FILES = "S3Files"

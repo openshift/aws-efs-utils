@@ -8,6 +8,8 @@ import os
 import tempfile
 from signal import SIGHUP, SIGKILL, SIGTERM
 
+import pytest
+
 import watchdog
 
 from .. import utils
@@ -82,12 +84,25 @@ def test_pid_file_not_in_state_dir(tmpdir):
     assert watchdog.get_pid_in_state_dir(STATE_FILE, str(tmpdir)) is None
 
 
+def test_get_pid_in_state_dir_deleted_before_open(mocker, tmpdir):
+    # Simulate the mount's unmount teardown deleting the pid file between the
+    # existence check and open() under high churn. get_pid_in_state_dir must
+    # return None rather than let FileNotFoundError crash the watchdog.
+    mount_dir = create_dir(tmpdir, MOUNT_STATE_DIR)
+    pid_dir, pid_file, abs_pid_file = create_pid_file(mount_dir, PID)
+    assert os.path.exists(abs_pid_file)
+
+    mocker.patch("watchdog.open", side_effect=FileNotFoundError)
+
+    assert watchdog.get_pid_in_state_dir(STATE_FILE, str(tmpdir)) is None
+
+
 def test_is_mount_stunnel_proc_running_pid_empty(tmpdir):
     assert False == watchdog.is_mount_stunnel_proc_running(None, STATE_FILE, tmpdir)
 
 
 def test_is_mount_stunnel_proc_running_process_not_stunnel(mocker, tmpdir):
-    mocker.patch("watchdog.check_process_name", return_value="java")
+    mocker.patch("watchdog.check_process_name_and_state", return_value=("java", None))
     mock_log_debug = mocker.patch("logging.debug")
 
     assert False == watchdog.is_mount_stunnel_proc_running(PID, STATE_FILE, tmpdir)
@@ -95,8 +110,27 @@ def test_is_mount_stunnel_proc_running_process_not_stunnel(mocker, tmpdir):
     assert "is not an efs-proxy or stunnel process" in debug_log
 
 
+@pytest.mark.parametrize("dead_state", watchdog.DEAD_RUN_STATES)
+def test_is_mount_stunnel_proc_running_process_in_dead_run_state(
+    mocker, tmpdir, dead_state
+):
+    """A zombie keeps its name until reaped, so only the state gets the tunnel
+    restarted."""
+    mocker.patch(
+        "watchdog.check_process_name_and_state", return_value=("stunnel", dead_state)
+    )
+    mocker.patch("watchdog.is_pid_running", return_value=True)
+    mock_log_debug = mocker.patch("logging.debug")
+
+    assert False == watchdog.is_mount_stunnel_proc_running(PID, STATE_FILE, tmpdir)
+    debug_log = mock_log_debug.call_args[0][0]
+    assert "has exited" in debug_log
+
+
 def test_is_mount_stunnel_proc_running_process_not_running(mocker, tmpdir):
-    mocker.patch("watchdog.check_process_name", return_value="stunnel")
+    mocker.patch(
+        "watchdog.check_process_name_and_state", return_value=("stunnel", None)
+    )
     mocker.patch("watchdog.is_pid_running", return_value=False)
     mock_log_debug = mocker.patch("logging.debug")
 
@@ -107,7 +141,9 @@ def test_is_mount_stunnel_proc_running_process_not_running(mocker, tmpdir):
 
 
 def test_is_mount_stunnel_proc_running_pid_file_not_exist(mocker, tmpdir):
-    mocker.patch("watchdog.check_process_name", return_value="stunnel")
+    mocker.patch(
+        "watchdog.check_process_name_and_state", return_value=("stunnel", None)
+    )
     mocker.patch("watchdog.is_pid_running", return_value=True)
     mount_dir = create_dir(tmpdir, MOUNT_STATE_DIR)
     assert not os.path.exists(os.path.join(str(mount_dir), watchdog.STUNNEL_PID_FILE))
@@ -122,7 +158,9 @@ def test_is_mount_stunnel_proc_running_pid_file_not_exist(mocker, tmpdir):
 
 
 def test_is_mount_stunnel_proc_running_pid_mismatch(mocker, tmpdir):
-    mocker.patch("watchdog.check_process_name", return_value="stunnel")
+    mocker.patch(
+        "watchdog.check_process_name_and_state", return_value=("stunnel", None)
+    )
     mocker.patch("watchdog.is_pid_running", return_value=True)
     mount_dir = create_dir(tmpdir, MOUNT_STATE_DIR)
     create_pid_file(mount_dir, PID + 1)
@@ -135,7 +173,9 @@ def test_is_mount_stunnel_proc_running_pid_mismatch(mocker, tmpdir):
 
 
 def test_is_mount_stunnel_proc_running(mocker, tmpdir):
-    mocker.patch("watchdog.check_process_name", return_value="stunnel")
+    mocker.patch(
+        "watchdog.check_process_name_and_state", return_value=("stunnel", None)
+    )
     mocker.patch("watchdog.is_pid_running", return_value=True)
     mount_dir = create_dir(tmpdir, MOUNT_STATE_DIR)
     create_pid_file(mount_dir, PID)

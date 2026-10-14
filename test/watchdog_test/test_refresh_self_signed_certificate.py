@@ -194,7 +194,7 @@ def _create_ca_conf_helper(
     credentials = "dummy:lookup" if iam else None
     ap_id = AP_ID if ap else None
     client_info = CLIENT_INFO if client_info else None
-    full_config_body = watchdog.create_ca_conf(
+    full_config_body, _ = watchdog.create_ca_conf(
         config,
         tls_dict["certificate_path"],
         COMMON_NAME,
@@ -655,7 +655,7 @@ def _test_recreate_certificate_with_valid_client_source_config(
 
     with open(os.path.join(tls_dict["mount_dir"], "config.conf")) as f:
         conf_body = f.read()
-        assert conf_body == watchdog.create_ca_conf(
+        recreated_conf_body, _ = watchdog.create_ca_conf(
             config,
             tmp_config_path,
             COMMON_NAME,
@@ -669,6 +669,7 @@ def _test_recreate_certificate_with_valid_client_source_config(
             AP_ID,
             expected_client_info,
         )
+        assert conf_body == recreated_conf_body
     assert os.path.exists(pk_path)
     assert os.path.exists(os.path.join(tls_dict["mount_dir"], "publicKey.pem"))
     assert os.path.exists(os.path.join(tls_dict["mount_dir"], "request.csr"))
@@ -709,7 +710,7 @@ def _test_recreate_certificate_with_invalid_client_source_config(
 
     with open(os.path.join(tls_dict["mount_dir"], "config.conf")) as f:
         conf_body = f.read()
-        assert conf_body == watchdog.create_ca_conf(
+        recreated_conf_body, _ = watchdog.create_ca_conf(
             config,
             tmp_config_path,
             COMMON_NAME,
@@ -723,6 +724,7 @@ def _test_recreate_certificate_with_invalid_client_source_config(
             AP_ID,
             expected_client_info,
         )
+        assert conf_body == recreated_conf_body
     assert os.path.exists(pk_path)
     assert os.path.exists(os.path.join(tls_dict["mount_dir"], "publicKey.pem"))
     assert os.path.exists(os.path.join(tls_dict["mount_dir"], "request.csr"))
@@ -954,3 +956,274 @@ def test_check_and_create_private_key_key_already_exists(mocker, tmpdir):
     state_file_dir = str(tmpdir)
     watchdog.check_and_create_private_key(state_file_dir)
     assert call_mock.call_count == 0
+
+
+# ---- Credential-expiration-driven certificate refresh ----
+
+EXPIRATION_FORMAT = watchdog.CREDENTIALS_EXPIRATION_DATETIME_FORMAT
+MARGIN = timedelta(minutes=watchdog.CERT_EXPIRATION_SAFETY_MARGIN_MIN)
+
+
+def test_parse_credentials_expiration_valid():
+    parsed = watchdog.parse_credentials_expiration(FIXED_DT.strftime(EXPIRATION_FORMAT))
+    assert parsed == FIXED_DT
+
+
+def test_parse_credentials_expiration_real_imds_value():
+    # Exact whole-second ISO-8601 shape a real IMDS credential returns.
+    assert watchdog.parse_credentials_expiration("2026-08-06T00:38:37Z") == datetime(
+        2026, 8, 6, 0, 38, 37, tzinfo=timezone.utc
+    )
+
+
+def test_parse_credentials_expiration_absent():
+    assert watchdog.parse_credentials_expiration(None) is None
+    assert watchdog.parse_credentials_expiration("") is None
+
+
+def test_parse_credentials_expiration_malformed(caplog):
+    # Values are validated before being persisted, so a malformed value reaching the parser
+    # (absent, or an externally corrupted state file) returns None silently and the caller falls
+    # back to the fixed interval; the warning lives at the persist sites, not here.
+    caplog.set_level(logging.WARNING)
+    assert watchdog.parse_credentials_expiration("not-a-timestamp") is None
+    assert caplog.text == ""
+
+
+def test_refresh_deadline_no_expiration_uses_fixed_interval():
+    deadline = watchdog.get_certificate_refresh_deadline(FIXED_DT, 60 * 60, None)
+    assert deadline == FIXED_DT + timedelta(minutes=60)
+
+
+def test_refresh_deadline_far_expiration_uses_fixed_interval():
+    far_expiration = FIXED_DT + timedelta(hours=6)
+    deadline = watchdog.get_certificate_refresh_deadline(
+        FIXED_DT, 60 * 60, far_expiration
+    )
+    assert deadline == FIXED_DT + timedelta(minutes=60)
+
+
+def test_refresh_deadline_near_expiration_refreshes_before_expiry():
+    near_expiration = FIXED_DT + timedelta(minutes=15)
+    deadline = watchdog.get_certificate_refresh_deadline(
+        FIXED_DT, 60 * 60, near_expiration
+    )
+    assert deadline == near_expiration - MARGIN
+
+
+def test_refresh_deadline_already_expired_token_is_in_the_past():
+    past_expiration = FIXED_DT - timedelta(minutes=13)
+    deadline = watchdog.get_certificate_refresh_deadline(
+        FIXED_DT, 60 * 60, past_expiration
+    )
+    assert deadline == past_expiration - MARGIN
+
+
+def test_refresh_deadline_capped_at_cert_ttl():
+    # A renewal interval longer than the cert's own NOT_AFTER_HOURS lifetime would push the refresh
+    # past the cert's expiry; it is capped at NOT_AFTER - margin.
+    deadline = watchdog.get_certificate_refresh_deadline(
+        FIXED_DT, 4 * 60 * 60, None  # 4h interval exceeds the 3h cert TTL
+    )
+    assert deadline == FIXED_DT + timedelta(hours=watchdog.NOT_AFTER_HOURS) - MARGIN
+
+
+def test_refresh_deadline_cert_ttl_cap_beats_far_expiration():
+    far_expiration = FIXED_DT + timedelta(hours=6)
+    deadline = watchdog.get_certificate_refresh_deadline(
+        FIXED_DT, 4 * 60 * 60, far_expiration
+    )
+    assert deadline == FIXED_DT + timedelta(hours=watchdog.NOT_AFTER_HOURS) - MARGIN
+
+
+def test_check_certificate_refreshes_when_token_near_expiry(mocker, tmpdir, caplog):
+    # Cert created 20 min ago (well within the 60-min fixed interval, so fixed-interval mode would
+    # NOT refresh), but the embedded token expires in 3 min => inside the 5-min safety margin,
+    # so the refresh deadline is already past and the cert must be refreshed now.
+    caplog.set_level(logging.DEBUG)
+    mocker.patch("watchdog.get_utc_now", return_value=FIXED_DT)
+    config = _get_config()
+    pk_path = _get_mock_private_key_path(mocker, tmpdir)
+    created = (FIXED_DT - timedelta(minutes=20)).strftime(DT_PATTERN)
+    tls_dict = watchdog.tls_paths_dictionary(MOUNT_NAME, str(tmpdir))
+    state = _create_certificate_and_state(
+        tls_dict,
+        str(tmpdir),
+        pk_path,
+        created,
+        security_credentials=CREDENTIALS,
+        credentials_source=CREDENTIALS_SOURCE,
+        ap_id=AP_ID,
+    )
+    state["certificateExpirationTime"] = (FIXED_DT + timedelta(minutes=3)).strftime(
+        EXPIRATION_FORMAT
+    )
+
+    fresh_expiration = (FIXED_DT + timedelta(hours=1)).strftime(EXPIRATION_FORMAT)
+    fresh_credentials = dict(CREDENTIALS, Expiration=fresh_expiration)
+    mocker.patch(
+        "watchdog.get_aws_security_credentials", return_value=fresh_credentials
+    )
+
+    watchdog.check_certificate(
+        config, state, str(tmpdir), STATE_FILE, SERVICE, base_path=str(tmpdir)
+    )
+
+    with open(os.path.join(str(tmpdir), STATE_FILE), "r") as state_json:
+        state = json.load(state_json)
+
+    assert datetime.strptime(
+        state["certificateCreationTime"], DT_PATTERN
+    ) > datetime.strptime(created, DT_PATTERN)
+    assert state["certificateExpirationTime"] == fresh_expiration
+    assert "early: scheduled deadline" in caplog.text
+
+
+def test_check_certificate_does_not_refresh_when_token_far_from_expiry(mocker, tmpdir):
+    mocker.patch("watchdog.get_utc_now", return_value=FIXED_DT)
+    config = _get_config()
+    pk_path = _get_mock_private_key_path(mocker, tmpdir)
+    created = (FIXED_DT - timedelta(minutes=20)).strftime(DT_PATTERN)
+    tls_dict = watchdog.tls_paths_dictionary(MOUNT_NAME, str(tmpdir))
+    state = _create_certificate_and_state(
+        tls_dict, str(tmpdir), pk_path, created, ap_id=AP_ID
+    )
+    state["certificateExpirationTime"] = (FIXED_DT + timedelta(hours=6)).strftime(
+        EXPIRATION_FORMAT
+    )
+
+    recreate_mock = mocker.patch("watchdog.recreate_certificate")
+
+    watchdog.check_certificate(
+        config, state, str(tmpdir), STATE_FILE, SERVICE, base_path=str(tmpdir)
+    )
+
+    recreate_mock.assert_not_called()
+
+
+def test_check_certificate_clears_stale_expiration_when_none_returned(
+    mocker, tmpdir, caplog
+):
+    caplog.set_level(logging.DEBUG)
+    mocker.patch("watchdog.get_utc_now", return_value=FIXED_DT)
+    config = _get_config()
+    pk_path = _get_mock_private_key_path(mocker, tmpdir)
+    created = (FIXED_DT - timedelta(minutes=90)).strftime(
+        DT_PATTERN
+    )  # past the interval
+    tls_dict = watchdog.tls_paths_dictionary(MOUNT_NAME, str(tmpdir))
+    state = _create_certificate_and_state(
+        tls_dict,
+        str(tmpdir),
+        pk_path,
+        created,
+        security_credentials=CREDENTIALS,
+        credentials_source=CREDENTIALS_SOURCE,
+        ap_id=AP_ID,
+    )
+    state["certificateExpirationTime"] = (FIXED_DT + timedelta(minutes=5)).strftime(
+        EXPIRATION_FORMAT
+    )
+
+    mocker.patch("watchdog.get_aws_security_credentials", return_value=CREDENTIALS)
+
+    watchdog.check_certificate(
+        config, state, str(tmpdir), STATE_FILE, SERVICE, base_path=str(tmpdir)
+    )
+
+    with open(os.path.join(str(tmpdir), STATE_FILE), "r") as state_json:
+        state = json.load(state_json)
+
+    assert "certificateExpirationTime" not in state
+    assert "No expiration available for these credentials" in caplog.text
+
+
+def _setup_ca_conf_dir(tmpdir):
+    tls_dict = certificate_utils.tls_paths_dictionary(MOUNT_NAME, str(tmpdir))
+    file_utils.create_required_directory({}, tls_dict["mount_dir"])
+    with open(os.path.join(tls_dict["mount_dir"], "publicKey.pem"), "w") as f:
+        f.write(PUBLIC_KEY_BODY)
+    return tls_dict
+
+
+def test_create_ca_conf_returns_credential_expiration(mocker, tmpdir):
+    mocker.patch("watchdog.get_utc_now", return_value=FIXED_DT)
+    expiration = (FIXED_DT + timedelta(hours=1)).strftime(EXPIRATION_FORMAT)
+    mocker.patch(
+        "watchdog.get_aws_security_credentials",
+        return_value=dict(CREDENTIALS, Expiration=expiration),
+    )
+    tls_dict = _setup_ca_conf_dir(tmpdir)
+    config_body, credentials_expiration = watchdog.create_ca_conf(
+        _get_config(),
+        os.path.join(tls_dict["mount_dir"], "config.conf"),
+        COMMON_NAME,
+        tls_dict["mount_dir"],
+        os.path.join(tls_dict["mount_dir"], "privateKey.pem"),
+        FIXED_DT,
+        REGION,
+        FS_ID,
+        "dummy:lookup",
+        SERVICE,
+        AP_ID,
+        CLIENT_INFO,
+    )
+    assert config_body
+    assert credentials_expiration == expiration
+
+
+def test_create_ca_conf_rejects_already_expired_credentials(mocker, tmpdir, caplog):
+    caplog.set_level(logging.ERROR)
+    mocker.patch("watchdog.get_utc_now", return_value=FIXED_DT)
+    expired = (FIXED_DT - timedelta(minutes=1)).strftime(EXPIRATION_FORMAT)
+    mocker.patch(
+        "watchdog.get_aws_security_credentials",
+        return_value=dict(CREDENTIALS, Expiration=expired),
+    )
+    tls_dict = _setup_ca_conf_dir(tmpdir)
+    config_body, credentials_expiration = watchdog.create_ca_conf(
+        _get_config(),
+        os.path.join(tls_dict["mount_dir"], "config.conf"),
+        COMMON_NAME,
+        tls_dict["mount_dir"],
+        os.path.join(tls_dict["mount_dir"], "privateKey.pem"),
+        FIXED_DT,
+        REGION,
+        FS_ID,
+        "dummy:lookup",
+        SERVICE,
+        AP_ID,
+        CLIENT_INFO,
+    )
+    assert config_body is None
+    assert credentials_expiration is None
+    assert "already-expired credentials" in caplog.text
+
+
+def test_create_ca_conf_drops_malformed_expiration(mocker, tmpdir, caplog):
+    # A present-but-unparseable expiration does not block minting; it is dropped (returned as None)
+    # with a warning so the caller schedules on the fixed interval instead.
+    caplog.set_level(logging.WARNING)
+    mocker.patch("watchdog.get_utc_now", return_value=FIXED_DT)
+    mocker.patch(
+        "watchdog.get_aws_security_credentials",
+        return_value=dict(CREDENTIALS, Expiration="1786127616"),  # epoch, not ISO-8601
+    )
+    tls_dict = _setup_ca_conf_dir(tmpdir)
+    config_body, credentials_expiration = watchdog.create_ca_conf(
+        _get_config(),
+        os.path.join(tls_dict["mount_dir"], "config.conf"),
+        COMMON_NAME,
+        tls_dict["mount_dir"],
+        os.path.join(tls_dict["mount_dir"], "privateKey.pem"),
+        FIXED_DT,
+        REGION,
+        FS_ID,
+        "dummy:lookup",
+        SERVICE,
+        AP_ID,
+        CLIENT_INFO,
+    )
+    assert config_body
+    assert credentials_expiration is None
+    assert "is not valid ISO-8601" in caplog.text

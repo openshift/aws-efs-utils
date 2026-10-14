@@ -445,6 +445,10 @@ def test_get_assumed_profile_credentials_via_botocore_botocore_present(mocker):
     get_credential_session_mock = MagicMock()
     boto_session_mock.get_credentials.return_value = get_credential_session_mock
     get_credential_session_mock.get_frozen_credentials.return_value = frozen_credentials
+    # Model a static (non-refreshable) profile: base botocore Credentials have no
+    # _expiry_time attribute, so no Expiration is surfaced. Without this delete, MagicMock
+    # would auto-create a truthy _expiry_time.
+    del get_credential_session_mock._expiry_time
 
     mocker.patch("botocore.session.get_session", return_value=boto_session_mock)
 

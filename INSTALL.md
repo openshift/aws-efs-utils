@@ -60,7 +60,7 @@ Refer to the official [Go documentation](https://go.dev/doc/install) for detaile
 
 ## GCC Version Requirements
 
-**For distributions with GCC 14 or later (Debian 13, Fedora 41/42, RHEL 10, openSUSE Tumbleweed):**
+**For distributions with GCC 14 or later (Debian 13, Fedora 41/42, RHEL 10, openSUSE Tumbleweed, openSUSE Leap 16):**
 
 The AWS-LC FIPS module requires GCC version 13 or earlier. If your distribution uses GCC 14 or later by default, you'll need to use GCC 13 instead. If package manager does not provide GCC version 13 or earlier, follow [instruction](https://gcc.gnu.org/install/) to install desired version of GCC.
 
@@ -234,6 +234,31 @@ For Debian 13, Fedora 41/42, RHEL 10 and openSUSE Tumbleweed, default GCC versio
 ### AWS-LC FIPS module build issue: Your compiler (cc) is not supported due to a memcmp related bug reported ###
 
 For Ubuntu 20.04, GCC installed from package manager on Ubuntu 20.04 show this error during build, follow instructions in GCC Version Requirements to install a compatiable GCC version.
+
+### efs-proxy aborts at startup with `<jemalloc>: Unsupported system page size` ###
+
+efs-proxy allocates through jemalloc, which fixes its page size at compile time and compares it
+against the kernel's page size at startup. A binary compiled where pages are 4 KiB aborts on a
+kernel with larger pages. This affects 64-bit ARM, because x86_64 has a single 4 KiB page size.
+
+Check the kernel that will run efs-utils:
+
+```bash
+getconf PAGESIZE
+```
+
+RHEL 8 on arm64 reports 65536, and SUSE ships a `kernel-64kb` package alongside its 4 KiB default.
+Amazon Linux 2, Amazon Linux 2023, RHEL 9, RHEL 10, Debian 12, Ubuntu 22.04, Ubuntu 24.04 and the
+SLES 15 SP6 default kernel report 4096.
+
+4096 needs no extra step. For 16384 or 65536, build from source and set the page size explicitly:
+
+```bash
+JEMALLOC_SYS_WITH_LG_PAGE=16 make rpm
+```
+
+Use the same variable with `./build-deb.sh` on DEB-based distributions. One binary built this way
+covers 4 KiB, 16 KiB and 64 KiB kernels.
 
 
 ## Running Tests

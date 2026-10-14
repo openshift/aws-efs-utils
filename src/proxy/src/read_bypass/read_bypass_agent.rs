@@ -12,6 +12,7 @@ use std::{
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::FutureExt;
 use log::{debug, error, info, trace, warn};
+use rand::Rng;
 use tokio::sync::mpsc;
 use xdr_codec::Pack;
 
@@ -27,7 +28,10 @@ use crate::{
         nfs_rpc_envelope::{NfsRpcEnvelope, NfsRpcInfo},
     },
     proxy_task::ConnectionMessage,
-    read_ahead::{error::ReadAheadCacheError, readahead_cache::FileReadAheadCache},
+    read_ahead::{
+        error::{ReadAheadCacheError, ReadAheadError},
+        readahead_cache::FileReadAheadCache,
+    },
     rpc::{rpc::RpcBatch, rpc_encoder::RpcEncoder, rpc_envelope::RpcMessageParams},
     shutdown::ShutdownHandle,
     util::{
@@ -36,7 +40,13 @@ use crate::{
         s3_data_reader::{S3DataReader, S3ReadBypassReader},
     },
 };
-use crate::{ctx_debug, ctx_error, ctx_trace, ctx_warn, util::fh_denylist::FileHandle};
+use crate::{ctx_debug, ctx_error, ctx_info, ctx_trace, ctx_warn, util::fh_denylist::FileHandle};
+
+/// Bounds of the random delay applied before returning NFS4ERR_DELAY for a transient
+/// read-bypass failure. The minimum matches the kernel's own 100ms retry interval; the maximum
+/// keeps per-retry latency bounded while still spreading correlated retries.
+const TRANSIENT_RETRY_DELAY_MIN: std::time::Duration = std::time::Duration::from_millis(100);
+const TRANSIENT_RETRY_DELAY_MAX: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReadBypassAgentError {
@@ -58,6 +68,22 @@ pub enum ReadBypassAgentError {
     DataEvicted,
     #[error("Unsupported message")]
     UnsupportedMessage,
+}
+
+impl ReadBypassAgentError {
+    /// Whether the failure is expected to clear on its own, so the read gets an NFS4ERR_DELAY
+    /// and another read-bypass attempt instead of denylisting the file handle.
+    ///
+    /// Denylisting pushes the same reads onto the NFS server, which reads the same S3 object.
+    /// For a throttled GET that amplifies the throttling instead of shedding it. Timeouts and
+    /// connection failures are excluded: a host with broken S3 connectivity is better off on the
+    /// server for the denylist TTL than retrying reads that keep timing out.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::DataEvicted | Self::S3Error(S3ClientError::Throttled)
+        )
+    }
 }
 
 #[async_trait::async_trait]
@@ -140,8 +166,22 @@ impl S3Reader for CachedS3Reader {
             .await
         {
             Ok(data) => Ok(data),
-            Err(e) if e.message.contains("Data evicted") => Err(ReadBypassAgentError::DataEvicted),
-            Err(e) => Err(ReadBypassAgentError::CacheInternalError(e)),
+            // Keep the error class so the caller's denylist policy can see a throttled GET or an
+            // evicted cache entry.
+            Err(ReadAheadError {
+                s3_error: Some(e), ..
+            }) => Err(ReadBypassAgentError::S3Error(e)),
+            Err(ReadAheadError {
+                cache_error: Some(ReadAheadCacheError::DataEvicted),
+                ..
+            }) => Err(ReadBypassAgentError::DataEvicted),
+            Err(ReadAheadError {
+                cache_error: Some(e),
+                ..
+            }) => Err(ReadBypassAgentError::CacheInternalError(e)),
+            Err(e) => Err(ReadBypassAgentError::CacheInternalError(
+                ReadAheadCacheError::Other(e.message),
+            )),
         }
     }
 }
@@ -313,7 +353,7 @@ impl ReadBypassAgent {
             error!("Unsupported compound type!");
             return false;
         }
-        return true;
+        true
     }
 
     /// Asynchronously process message received from Dispatcher and respond to NFS Client
@@ -332,7 +372,7 @@ impl ReadBypassAgent {
         if let RefNfsCompound::Compound4res(compound_info) = &mut envelope.body {
             match Self::process_compound(
                 read_bypass_request_context.clone(),
-                &compound_info,
+                compound_info,
                 s3_reader.clone(),
             )
             .await
@@ -381,18 +421,33 @@ impl ReadBypassAgent {
                                  software: consider disabling ReadBypass functionality."
                             );
                         }
-                        ReadBypassAgentError::DataEvicted => {
-                            // Transient memory pressure - send delay, don't denylist
-                            ctx_warn!(
+                        _ if e.is_transient() => {
+                            // The read is expected to succeed on retry, so send NFS4ERR_DELAY and
+                            // leave the filehandle eligible for read bypass.
+                            let delay = Self::transient_retry_delay();
+                            // INFO, not DEBUG: this is the only record that a read was retried
+                            // instead of denylisted, and the default logging level is INFO. It is
+                            // one line per transient failure, which is the same rate the read
+                            // would have logged if it had been denylisted instead.
+                            ctx_info!(
                                 read_bypass_request_context,
-                                "Data evicted, sending NFS4ERR_DELAY without denylisting"
+                                "Transient ReadBypass failure ({e}), sending NFS4ERR_DELAY after {delay:?} without denylisting"
                             );
-                            let _ = Self::respond_failure_to_nfs_client(
+                            // We are inside a per-request `tokio::spawn`, so sleeping here delays
+                            // only this response, not the agent's message loop.
+                            tokio::time::sleep(delay).await;
+                            if let Err(e) = Self::respond_failure_to_nfs_client(
                                 read_bypass_request_context.clone(),
                                 message,
                                 nfs_client_sender,
                             )
-                            .await;
+                            .await
+                            {
+                                ctx_warn!(
+                                    read_bypass_request_context,
+                                    "Failed to send NFS4ERR_DELAY response for transient failure: {e}"
+                                );
+                            }
                         }
                         _ => {
                             ctx_warn!(
@@ -400,10 +455,9 @@ impl ReadBypassAgent {
                                 "Error while processing ReadBypass compound: {e}"
                             );
 
-                            // Denylist file handle, assuming that any failure during processing
-                            // compound at this phase is caused by issues with S3 access and highly
-                            // likely will repeat itself, so we want to deny list filehandle to
-                            // avoid availability issues.
+                            // The failure is not expected to clear on its own, so denylist the
+                            // file handle and let the NFS server serve this file's reads for the
+                            // denylist TTL.
                             for (size, op) in compound_info.compound.resarray.iter_mut().enumerate()
                             {
                                 if let nfs_resop4::OP_AWSFILE_READ_BYPASS(
@@ -535,9 +589,9 @@ impl ReadBypassAgent {
                             index
                         );
                         return Err(ReadBypassAgentError::CacheInternalError(
-                            ReadAheadCacheError {
-                                message: "No data returned from read operation".to_string(),
-                            },
+                            ReadAheadCacheError::Other(
+                                "No data returned from read operation".to_string(),
+                            ),
                         ));
                     }
                     Err(ReadBypassAgentError::DataEvicted) => {
@@ -607,13 +661,23 @@ impl ReadBypassAgent {
         }
         let rpc_params = original_message.envelopes[0].header.params.clone();
 
-        return Self::send_rpc_to_client(
+        Self::send_rpc_to_client(
             read_bypass_request_context.clone(),
             rpc_params,
             nfs_client_sender,
             response_compound,
         )
-        .await;
+        .await
+    }
+
+    /// Random delay to wait before returning NFS4ERR_DELAY for a transient failure.
+    ///
+    /// This is the only backoff between NFS retry cycles: the S3 client's exponential backoff
+    /// applies only within a single GetObject, and the Linux NFS client retries NFS4ERR_DELAY on
+    /// a READ with a flat, unjittered 100ms, so clients that hit the same throttling event would
+    /// otherwise retry in lockstep. See `docs/read_bypass_design.md` for the kernel references.
+    fn transient_retry_delay() -> std::time::Duration {
+        rand::thread_rng().gen_range(TRANSIENT_RETRY_DELAY_MIN..=TRANSIENT_RETRY_DELAY_MAX)
     }
 
     async fn respond_failure_to_nfs_client(
@@ -635,13 +699,13 @@ impl ReadBypassAgent {
         };
         let rpc_params = message.envelopes[0].header.params.clone();
 
-        return Self::send_rpc_to_client(
+        Self::send_rpc_to_client(
             read_bypass_request_context.clone(),
             rpc_params,
             nfs_client_sender,
             out_compound,
         )
-        .await;
+        .await
     }
 
     async fn send_rpc_to_client(
@@ -666,7 +730,7 @@ impl ReadBypassAgent {
         )
         .map_err(|_| ReadBypassAgentError::NfsResponseEncodingError)?;
         let rpc_batch: RpcBatch = RpcBatch {
-            rpcs: vec![BytesMut::from(encoded_rpc)],
+            rpcs: vec![encoded_rpc],
         };
         ctx_trace!(
             read_bypass_request_context,
@@ -717,18 +781,19 @@ mod tests {
     use crate::rpc::rpc_envelope::{
         EnvelopeHeader, RpcMessageParams, RpcMessageType, RpcReplyParams,
     };
-    use crate::test_utils::get_test_config;
+    use crate::test_utils::{get_test_config, FailingS3Reader};
     use crate::util::read_bypass_request_context;
     use bytes::{Bytes, BytesMut};
     use mockall::predicate::le;
+    use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
     use tokio_util::sync::CancellationToken;
     use xdr_codec::Pack;
 
     /////////////////////////////////////////////////////////////////////////////////////
-    /// Auxiliary test functions
-    ///
+    // Auxiliary test functions
+    /////////////////////////////////////////////////////////////////////////////////////
 
     fn create_compound_res_without_readbypass() -> COMPOUND4res {
         COMPOUND4res {
@@ -851,8 +916,8 @@ mod tests {
     }
 
     /////////////////////////////////////////////////////////////////////////////////////
-    /// Mocks
-    ///
+    // Mocks
+    /////////////////////////////////////////////////////////////////////////////////////
 
     impl MockS3DataReader {
         fn new(should_succeed: bool, data: Bytes) -> Self {
@@ -1143,7 +1208,7 @@ mod tests {
         });
         let result = ReadBypassAgent::process_compound(
             read_bypass_request_context,
-            &mut compound_info,
+            &compound_info,
             s3_reader,
         )
         .await;
@@ -1540,7 +1605,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_data_evicted_does_not_denylist() {
         // DataEvicted should send NFS4ERR_DELAY but NOT denylist
         let mock_reader: Arc<dyn S3Reader> = Arc::new(DataEvictedMockReader::new(2));
@@ -1595,6 +1660,140 @@ mod tests {
                     nfsstat4::NFS4ERR_DELAY
                 ));
             }
+        }
+    }
+
+    /// Runs one read-bypass reply whose S3 read fails with `make_error`, and reports whether the
+    /// file handle ended up denylisted along with the status returned to the NFS client.
+    async fn denylist_and_status_for_s3_error(
+        make_error: fn() -> S3ClientError,
+    ) -> (bool, nfsstat4) {
+        let s3_reader: Arc<dyn S3Reader> = Arc::new(FailingS3Reader { make_error });
+        let read_bypass_context = Arc::new(ReadBypassContext::default().await);
+        let read_bypass_request_context =
+            Arc::new(ReadBypassRequestContext::new(read_bypass_context, 0));
+        let (nfs_client_sender, mut nfs_client_receiver) = mpsc::channel::<ConnectionMessage>(10);
+
+        let compound_res = COMPOUND4res {
+            status: nfsstat4::NFS4_OK,
+            tag: utf8string(b"test".to_vec()),
+            resarray: vec![
+                get_sample_op_sequence_res(),
+                get_sample_op_read_bypass_accepted_res(0, 1024, 2048),
+                get_sample_op_getattr_res(),
+            ],
+        };
+        let message = create_nfs_rpc_envelope_batch_from_compound(
+            RpcMessageType::Reply,
+            compound_res.clone(),
+        );
+
+        ReadBypassAgent::process_message(
+            read_bypass_request_context.clone(),
+            message,
+            s3_reader,
+            nfs_client_sender,
+        )
+        .await;
+
+        let denylisted = if let nfs_resop4::OP_AWSFILE_READ_BYPASS(
+            AWSFILE_READ_BYPASS4res::NFS4ERR_AWSFILE_BYPASS(err_op),
+        ) = &compound_res.resarray[1]
+        {
+            read_bypass_request_context
+                .fh_denylist
+                .contains(&err_op.filehandle)
+        } else {
+            panic!("Expected read bypass file error");
+        };
+
+        let response = nfs_client_receiver
+            .recv()
+            .await
+            .expect("Should receive a response");
+        let ConnectionMessage::Response(batch) = response;
+        let nfs_envelope = NfsRpcEnvelope::try_from(batch.rpcs[0].clone())
+            .expect("Failed to parse NfsRpcEnvelope");
+        let status = if let RefNfsCompound::Compound4res(compound_info) = &nfs_envelope.body {
+            compound_info.compound.status
+        } else {
+            panic!("Expected Compound4res");
+        };
+
+        (denylisted, status)
+    }
+
+    /// A throttled S3 GET is the failure mode this policy exists for: the server would read
+    /// the very same S3 object and hit the same throttling, so denylisting the file handle
+    /// amplifies the event for the full denylist TTL instead of shedding it.
+    #[tokio::test(start_paused = true)]
+    async fn test_throttled_s3_does_not_denylist() {
+        let (denylisted, status) =
+            denylist_and_status_for_s3_error(|| S3ClientError::Throttled).await;
+
+        assert!(
+            !denylisted,
+            "Should NOT denylist the file handle on a throttled S3 GET"
+        );
+        assert!(
+            matches!(status, nfsstat4::NFS4ERR_DELAY),
+            "Expected NFS4ERR_DELAY, got {status:?}"
+        );
+    }
+
+    /// Counterpart to the test above: failures that will not clear on their own still denylist,
+    /// so reads for that file fall back to the NFS server instead of failing repeatedly.
+    #[tokio::test]
+    async fn test_non_transient_s3_errors_still_denylist() {
+        for make_error in [
+            (|| S3ClientError::AccessDenied) as fn() -> S3ClientError,
+            || S3ClientError::NoSuchKey,
+            || S3ClientError::ETagMismatchError,
+            || S3ClientError::Timeout,
+            || S3ClientError::NotEnabled,
+        ] {
+            let (denylisted, status) = denylist_and_status_for_s3_error(make_error).await;
+            assert!(
+                denylisted,
+                "Should denylist on non-transient error {:?}",
+                make_error()
+            );
+            assert!(
+                matches!(status, nfsstat4::NFS4ERR_DELAY),
+                "Expected NFS4ERR_DELAY, got {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_transient_classification() {
+        assert!(ReadBypassAgentError::DataEvicted.is_transient());
+        assert!(ReadBypassAgentError::S3Error(S3ClientError::Throttled).is_transient());
+
+        for error in [
+            ReadBypassAgentError::S3Error(S3ClientError::AccessDenied),
+            ReadBypassAgentError::S3Error(S3ClientError::NoSuchKey),
+            ReadBypassAgentError::S3Error(S3ClientError::ETagMismatchError),
+            ReadBypassAgentError::S3Error(S3ClientError::Timeout),
+            ReadBypassAgentError::S3Error(S3ClientError::NotEnabled),
+            ReadBypassAgentError::S3Error(S3ClientError::SizeMismatch {
+                expected: 2,
+                actual: 1,
+            }),
+            ReadBypassAgentError::CacheInternalError(ReadAheadCacheError::Other(
+                "boom".to_string(),
+            )),
+            ReadBypassAgentError::DispatchingError,
+            ReadBypassAgentError::InvalidCompound,
+            ReadBypassAgentError::JoinFailure,
+            ReadBypassAgentError::NfsResponseEncodingError,
+            ReadBypassAgentError::OperationConversionFailure,
+            ReadBypassAgentError::UnsupportedMessage,
+        ] {
+            assert!(
+                !error.is_transient(),
+                "{error:?} should not be treated as transient"
+            );
         }
     }
 

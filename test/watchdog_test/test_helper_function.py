@@ -294,6 +294,7 @@ def test_get_assumed_profile_credentials_via_botocore_botocore_present(mocker):
     get_credential_session_mock = MagicMock()
     boto_session_mock.get_credentials.return_value = get_credential_session_mock
     get_credential_session_mock.get_frozen_credentials.return_value = frozen_credentials
+    get_credential_session_mock._expiry_time = None  # static profile: no expiry
 
     mocker.patch("botocore.session.get_session", return_value=boto_session_mock)
 
@@ -305,6 +306,56 @@ def test_get_assumed_profile_credentials_via_botocore_botocore_present(mocker):
     )
     boto_session_mock.get_credentials.assert_called_once_with()
     get_credential_session_mock.get_frozen_credentials.assert_called_once_with()
+
+
+def test_get_assumed_profile_credentials_via_botocore_surfaces_expiration(mocker):
+    # A temporary (assumed-role/session) profile carries _expiry_time; the watchdog helper surfaces
+    # it as an ISO-8601 Expiration so the cert refresh can schedule ahead of it.
+    from datetime import datetime, timezone
+
+    boto_session_mock = MagicMock()
+    ReadOnlyCredentials = namedtuple(
+        "ReadOnlyCredentials", ["access_key", "secret_key", "token"]
+    )
+    frozen_credentials = ReadOnlyCredentials(
+        ACCESS_KEY_ID_VAL, SECRET_ACCESS_KEY_VAL, SESSION_TOKEN_VAL
+    )
+    get_credential_session_mock = MagicMock()
+    get_credential_session_mock.get_frozen_credentials.return_value = frozen_credentials
+    get_credential_session_mock._expiry_time = datetime(
+        2026, 8, 6, 0, 38, 37, tzinfo=timezone.utc
+    )
+    boto_session_mock.get_credentials.return_value = get_credential_session_mock
+    mocker.patch("botocore.session.get_session", return_value=boto_session_mock)
+
+    credentials = watchdog.botocore_credentials_helper("test_profile")
+
+    assert credentials["AccessKeyId"] == ACCESS_KEY_ID_VAL
+    assert credentials["Expiration"] == "2026-08-06T00:38:37Z"
+
+
+def test_get_assumed_profile_credentials_via_botocore_ignores_non_datetime_expiry(
+    mocker,
+):
+    # Defensive: if botocore's private _expiry_time is ever not a datetime, skip surfacing
+    # Expiration rather than crash on strftime.
+    boto_session_mock = MagicMock()
+    ReadOnlyCredentials = namedtuple(
+        "ReadOnlyCredentials", ["access_key", "secret_key", "token"]
+    )
+    frozen_credentials = ReadOnlyCredentials(
+        ACCESS_KEY_ID_VAL, SECRET_ACCESS_KEY_VAL, SESSION_TOKEN_VAL
+    )
+    get_credential_session_mock = MagicMock()
+    get_credential_session_mock.get_frozen_credentials.return_value = frozen_credentials
+    get_credential_session_mock._expiry_time = "not-a-datetime"
+    boto_session_mock.get_credentials.return_value = get_credential_session_mock
+    mocker.patch("botocore.session.get_session", return_value=boto_session_mock)
+
+    credentials = watchdog.botocore_credentials_helper("test_profile")
+
+    assert credentials["AccessKeyId"] == ACCESS_KEY_ID_VAL
+    assert "Expiration" not in credentials
 
 
 def test_get_assumed_profile_credentials_via_botocore_botocore_present_profile_not_found(

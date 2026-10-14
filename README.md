@@ -1,4 +1,4 @@
-[![CircleCI](https://circleci.com/gh/aws/efs-utils.svg?style=svg)](https://circleci.com/gh/aws/efs-utils)
+[![CI](https://github.com/aws/efs-utils/actions/workflows/ci.yaml/badge.svg)](https://github.com/aws/efs-utils/actions/workflows/ci.yaml)
 
 # Amazon efs-utils
 

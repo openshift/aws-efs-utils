@@ -221,6 +221,175 @@ def test_bootstrap_proxy_cert_created_tls_mount(mocker, tmpdir):
     assert os.path.exists(pk_path)
 
 
+def test_bootstrap_proxy_persists_credential_expiration_for_iam_mount(mocker, tmpdir):
+    write_config_mock = setup_mocks_without_popen(mocker)
+    write_state_mock = mocker.patch(
+        "efs_utils_common.proxy.write_tunnel_state_file", return_value="~mocktempfile"
+    )
+    mocker.patch(
+        "efs_utils_common.proxy.get_mount_specific_filename", return_value=DNS_NAME
+    )
+    mocker.patch("efs_utils_common.proxy.get_target_region", return_value=REGION)
+    mocker.patch("efs_utils_common.proxy.is_ocsp_enabled", return_value=False)
+    mocker.patch("efs_utils_common.proxy.create_certificate", return_value="dummytime")
+    mocker.patch(
+        "efs_utils_common.proxy._efs_proxy_bin", return_value="/usr/bin/efs-proxy"
+    )
+    pk_path = os.path.join(str(tmpdir), "privateKey.pem")
+    mocker.patch("efs_utils_common.proxy.get_private_key_path", return_value=pk_path)
+
+    expiration = "2026-08-06T00:38:37Z"  # whole-second ISO-8601 shape IMDS returns
+    mocker.patch(
+        "efs_utils_common.proxy.get_aws_security_credentials",
+        return_value=(
+            {
+                "AccessKeyId": "AKID",
+                "SecretAccessKey": "SECRET",
+                "Token": "TOKEN",
+                "Expiration": expiration,
+            },
+            "metadata:",
+        ),
+    )
+
+    MOCK_CONFIG.get.side_effect = None
+    MOCK_CONFIG.get.return_value = "info"
+    MOCK_CONFIG.getboolean.return_value = True
+
+    try:
+        with proxy.bootstrap_proxy(
+            MOCK_CONFIG,
+            INIT_SYSTEM,
+            DNS_NAME,
+            FS_ID,
+            MOUNT_POINT,
+            {"tls": None, "iam": None},
+            str(tmpdir),
+        ):
+            pass
+    except OSError:
+        pass
+
+    assert write_state_mock.called
+    cert_details = write_state_mock.call_args.kwargs["cert_details"]
+    assert cert_details["certificateExpirationTime"] == expiration
+    assert write_config_mock.called
+
+
+def test_bootstrap_proxy_drops_malformed_credential_expiration(mocker, tmpdir, caplog):
+    import logging
+
+    caplog.set_level(logging.WARNING)
+    setup_mocks_without_popen(mocker)
+    write_state_mock = mocker.patch(
+        "efs_utils_common.proxy.write_tunnel_state_file", return_value="~mocktempfile"
+    )
+    mocker.patch(
+        "efs_utils_common.proxy.get_mount_specific_filename", return_value=DNS_NAME
+    )
+    mocker.patch("efs_utils_common.proxy.get_target_region", return_value=REGION)
+    mocker.patch("efs_utils_common.proxy.is_ocsp_enabled", return_value=False)
+    mocker.patch("efs_utils_common.proxy.create_certificate", return_value="dummytime")
+    mocker.patch(
+        "efs_utils_common.proxy._efs_proxy_bin", return_value="/usr/bin/efs-proxy"
+    )
+    pk_path = os.path.join(str(tmpdir), "privateKey.pem")
+    mocker.patch("efs_utils_common.proxy.get_private_key_path", return_value=pk_path)
+
+    mocker.patch(
+        "efs_utils_common.proxy.get_aws_security_credentials",
+        return_value=(
+            {
+                "AccessKeyId": "AKID",
+                "SecretAccessKey": "SECRET",
+                "Token": "TOKEN",
+                "Expiration": "1786127616",  # epoch, not ISO-8601
+            },
+            "metadata:",
+        ),
+    )
+
+    MOCK_CONFIG.get.side_effect = None
+    MOCK_CONFIG.get.return_value = "info"
+    MOCK_CONFIG.getboolean.return_value = True
+
+    try:
+        with proxy.bootstrap_proxy(
+            MOCK_CONFIG,
+            INIT_SYSTEM,
+            DNS_NAME,
+            FS_ID,
+            MOUNT_POINT,
+            {"tls": None, "iam": None},
+            str(tmpdir),
+        ):
+            pass
+    except OSError:
+        pass
+
+    assert write_state_mock.called
+    cert_details = write_state_mock.call_args.kwargs["cert_details"]
+    assert "certificateExpirationTime" not in cert_details
+    assert "is not valid ISO-8601" in caplog.text
+
+
+def test_bootstrap_proxy_no_expiration_logs_debug(mocker, tmpdir, caplog):
+    import logging
+
+    caplog.set_level(logging.DEBUG)
+    setup_mocks_without_popen(mocker)
+    write_state_mock = mocker.patch(
+        "efs_utils_common.proxy.write_tunnel_state_file", return_value="~mocktempfile"
+    )
+    mocker.patch(
+        "efs_utils_common.proxy.get_mount_specific_filename", return_value=DNS_NAME
+    )
+    mocker.patch("efs_utils_common.proxy.get_target_region", return_value=REGION)
+    mocker.patch("efs_utils_common.proxy.is_ocsp_enabled", return_value=False)
+    mocker.patch("efs_utils_common.proxy.create_certificate", return_value="dummytime")
+    mocker.patch(
+        "efs_utils_common.proxy._efs_proxy_bin", return_value="/usr/bin/efs-proxy"
+    )
+    pk_path = os.path.join(str(tmpdir), "privateKey.pem")
+    mocker.patch("efs_utils_common.proxy.get_private_key_path", return_value=pk_path)
+
+    mocker.patch(
+        "efs_utils_common.proxy.get_aws_security_credentials",
+        return_value=(
+            {
+                "AccessKeyId": "AKID",
+                "SecretAccessKey": "SECRET",
+                "Token": "TOKEN",
+                # no Expiration key
+            },
+            "metadata:",
+        ),
+    )
+
+    MOCK_CONFIG.get.side_effect = None
+    MOCK_CONFIG.get.return_value = "info"
+    MOCK_CONFIG.getboolean.return_value = True
+
+    try:
+        with proxy.bootstrap_proxy(
+            MOCK_CONFIG,
+            INIT_SYSTEM,
+            DNS_NAME,
+            FS_ID,
+            MOUNT_POINT,
+            {"tls": None, "iam": None},
+            str(tmpdir),
+        ):
+            pass
+    except OSError:
+        pass
+
+    assert write_state_mock.called
+    cert_details = write_state_mock.call_args.kwargs["cert_details"]
+    assert "certificateExpirationTime" not in cert_details
+    assert "No credential expiration available" in caplog.text
+
+
 def test_bootstrap_proxy_cert_not_created_non_tls_mount(mocker, tmpdir):
     setup_mocks_without_popen(mocker)
     mocker.patch(

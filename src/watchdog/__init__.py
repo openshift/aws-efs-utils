@@ -56,7 +56,7 @@ AMAZON_LINUX_2_RELEASE_VERSIONS = [
     AMAZON_LINUX_2_RELEASE_ID,
     AMAZON_LINUX_2_PRETTY_NAME,
 ]
-VERSION = "3.2.0"
+VERSION = "3.3.2"
 SERVICE = "elasticfilesystem"
 FS_PREFIX = "fs-"
 
@@ -66,10 +66,13 @@ MOUNT_CONFIG_SECTION = "mount"
 CLIENT_INFO_SECTION = "client-info"
 CLIENT_SOURCE_STR_LEN_LIMIT = 100
 DISABLE_FETCH_EC2_METADATA_TOKEN_ITEM = "disable_fetch_ec2_metadata_token"
+URL_REQUEST_TIMEOUT_ITEM = "url_request_timeout_sec"
 DEFAULT_UNKNOWN_VALUE = "unknown"
 DEFAULT_MACOS_VALUE = "macos"
-# 50ms
+# 50ms - sleep interval for lock file retry
 DEFAULT_TIMEOUT = 0.05
+# 1 second - default timeout for URL requests (configurable via url_request_timeout_sec)
+DEFAULT_URL_REQUEST_TIMEOUT_SEC = 1
 
 LOG_DIR = "/var/log/amazon/efs"
 LOG_FILE = "mount-watchdog.log"
@@ -81,6 +84,8 @@ DEFAULT_NFS_PORT = "2049"
 EFS_SERVICE_NAME = "elasticfilesystem"
 PRIVATE_KEY_FILE = "/etc/amazon/efs/privateKey.pem"
 DEFAULT_REFRESH_SELF_SIGNED_CERT_INTERVAL_MIN = 60
+# Refresh the certificate this many minutes before the credential (or the cert's own NOT_AFTER) expires.
+CERT_EXPIRATION_SAFETY_MARGIN_MIN = 5
 DEFAULT_STUNNEL_HEALTH_CHECK_INTERVAL_MIN = 5
 DEFAULT_STUNNEL_HEALTH_CHECK_TIMEOUT_SEC = 30
 NOT_BEFORE_MINS = 15
@@ -88,6 +93,7 @@ NOT_AFTER_HOURS = 3
 DATE_ONLY_FORMAT = "%Y%m%d"
 SIGV4_DATETIME_FORMAT = "%Y%m%dT%H%M%SZ"
 CERT_DATETIME_FORMAT = "%y%m%d%H%M%SZ"
+CREDENTIALS_EXPIRATION_DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 AWS_CREDENTIALS_FILES = {
     "credentials": os.path.expanduser(
@@ -172,6 +178,15 @@ Mount = namedtuple(
 
 NFSSTAT_TIMEOUT = 5
 
+# Bounds the `ps` call used to look up a process name on macOS, which has no procfs.
+PROCESS_NAME_TIMEOUT_SEC = 5
+
+PROC_STAT_PATH_FORMAT = "/proc/%s/stat"
+
+# Run states from /proc/<pid>/stat field 3 that mean the process has exited but is
+# still listed. Z is the one that occurs: a zombie keeps its name until reaped.
+DEAD_RUN_STATES = (b"Z", b"X", b"x")
+
 # Unmount difference time in seconds
 UNMOUNT_DIFF_TIME = 30
 
@@ -189,8 +204,8 @@ EFS_PROXY_BIN = "efs-proxy"
 OPTIMIZE_READAHEAD_ITEM = "optimize_readahead"
 DEFAULT_NFS_MAX_READAHEAD_MULTIPLIER = 15
 NFS_READAHEAD_CONFIG_PATH_FORMAT = "/sys/class/bdi/%s:%s/read_ahead_kb"
+NFS_READAHEAD_OPTIMIZE_LINUX_KERNEL_MIN_VERSION = [5, 4]
 DEFAULT_RSIZE = 1048576
-UBUNTU_24_RELEASE = "Ubuntu 24"
 
 
 def fatal_error(user_message, log_message=None):
@@ -268,9 +283,48 @@ def fetch_ec2_metadata_token_disabled(config):
     )
 
 
-def get_aws_ec2_metadata_token(timeout=DEFAULT_TIMEOUT):
-    # Normally the session token is fetched within 10ms, setting a timeout of 50ms here to abort the request
-    # and return None if the token has not returned within 50ms
+def get_url_request_timeout(config):
+    """Read the URL request timeout from config, falling back to DEFAULT_URL_REQUEST_TIMEOUT_SEC.
+
+    This is a local copy for watchdog since it cannot import from efs_utils_common.
+    """
+    try:
+        timeout = config.getfloat(MOUNT_CONFIG_SECTION, URL_REQUEST_TIMEOUT_ITEM)
+        if timeout <= 0:
+            logging.warning(
+                "Invalid value for '%s' in config section [%s]: %s "
+                "(must be positive), falling back to %ss",
+                URL_REQUEST_TIMEOUT_ITEM,
+                MOUNT_CONFIG_SECTION,
+                timeout,
+                DEFAULT_URL_REQUEST_TIMEOUT_SEC,
+            )
+            return DEFAULT_URL_REQUEST_TIMEOUT_SEC
+        if timeout != DEFAULT_URL_REQUEST_TIMEOUT_SEC:
+            logging.debug(
+                "Using configured %s=%s from section [%s]",
+                URL_REQUEST_TIMEOUT_ITEM,
+                timeout,
+                MOUNT_CONFIG_SECTION,
+            )
+        return timeout
+    except (NoOptionError, NoSectionError):
+        return DEFAULT_URL_REQUEST_TIMEOUT_SEC
+    except ValueError:
+        logging.warning(
+            "Invalid (non-numeric) value for '%s' in config section [%s], "
+            "falling back to %ss",
+            URL_REQUEST_TIMEOUT_ITEM,
+            MOUNT_CONFIG_SECTION,
+            DEFAULT_URL_REQUEST_TIMEOUT_SEC,
+        )
+        return DEFAULT_URL_REQUEST_TIMEOUT_SEC
+
+
+def get_aws_ec2_metadata_token(timeout=DEFAULT_URL_REQUEST_TIMEOUT_SEC):
+    # Normally the session token is fetched within 10ms, setting a timeout of 1s here to abort the request
+    # and return None if the token has not returned within the timeout. This is configurable via
+    # 'url_request_timeout_sec' in efs-utils.conf.
     try:
         opener = build_opener(HTTPHandler)
         request = Request(INSTANCE_METADATA_TOKEN_URL)
@@ -351,7 +405,8 @@ def botocore_credentials_helper(awsprofile):
     session.set_config_variable("profile", awsprofile)
 
     try:
-        frozen_credentials = session.get_credentials().get_frozen_credentials()
+        creds_object = session.get_credentials()
+        frozen_credentials = creds_object.get_frozen_credentials()
     except ProfileNotFound as e:
         logging.error(
             "%s, please add the [profile %s] section in the aws config file following %s and %s."
@@ -362,6 +417,13 @@ def botocore_credentials_helper(awsprofile):
     credentials["AccessKeyId"] = frozen_credentials.access_key
     credentials["SecretAccessKey"] = frozen_credentials.secret_key
     credentials["Token"] = frozen_credentials.token
+    # Surface the expiration for temporary (assumed-role/session) profiles so refresh schedules
+    # ahead of it. botocore exposes it only via the private _expiry_time; static profiles have none.
+    expiry_time = getattr(creds_object, "_expiry_time", None)
+    if isinstance(expiry_time, datetime):
+        credentials["Expiration"] = expiry_time.strftime(
+            CREDENTIALS_EXPIRATION_DATETIME_FORMAT
+        )
     return credentials
 
 
@@ -475,6 +537,7 @@ def get_aws_security_credentials_from_webidentity(config, role_arn, token_file, 
                 "AccessKeyId": creds["AccessKeyId"],
                 "SecretAccessKey": creds["SecretAccessKey"],
                 "Token": creds["SessionToken"],
+                "Expiration": creds.get("Expiration"),
             }
 
     return None
@@ -598,6 +661,8 @@ def url_request_helper(config, url, unsuccessful_resp, url_error_msg, headers={}
         for k, v in headers.items():
             req.add_header(k, v)
 
+        timeout = get_url_request_timeout(config)
+
         if not fetch_ec2_metadata_token_disabled(config) and is_instance_metadata_url(
             url
         ):
@@ -606,11 +671,11 @@ def url_request_helper(config, url, unsuccessful_resp, url_error_msg, headers={}
             # IMDSv2 is a session-oriented method to access instance metadata
             # We expect the token retrieve will fail in bridge networking environment (e.g. container) since the default hop
             # limit for getting the token is 1. If the token retrieve does timeout, we fallback to use IMDSv1 instead
-            token = get_aws_ec2_metadata_token()
+            token = get_aws_ec2_metadata_token(timeout=timeout)
             if token:
                 req.add_header("X-aws-ec2-metadata-token", token)
 
-        request_resp = urlopen(req, timeout=1)
+        request_resp = urlopen(req, timeout=timeout)
 
         return get_resp_obj(request_resp, url, unsuccessful_resp)
     except socket.timeout:
@@ -891,10 +956,15 @@ def get_pid_in_state_dir(state_file, state_file_dir):
     state_dir_pid_path = os.path.join(
         state_file_dir, state_file + "+", STUNNEL_PID_FILE
     )
-    if os.path.exists(state_dir_pid_path):
+    # Open directly rather than checking os.path.exists() first: under high mount
+    # churn the mount's own unmount teardown can delete this pid file between the
+    # existence check and the open, and the resulting FileNotFoundError would crash
+    # the watchdog. Letting open() answer "does it exist" atomically avoids that race.
+    try:
         with open(state_dir_pid_path) as f:
             return f.read()
-    return None
+    except FileNotFoundError:
+        return None
 
 
 def is_mount_stunnel_proc_running(state_pid, state_file, state_file_dir):
@@ -919,14 +989,24 @@ def is_mount_stunnel_proc_running(state_pid, state_file, state_file_dir):
         logging.debug("State pid is None for %s", state_file)
         return False
 
-    process_name = check_process_name(state_pid)
+    process_name, process_state = check_process_name_and_state(state_pid)
     if not process_name or (
         "efs-proxy" not in str(process_name) and "stunnel" not in str(process_name)
     ):
         logging.debug(
-            "Process running on %s is not an efs-proxy or stunnel process, full command: %s.",
+            "Process running on %s is not an efs-proxy or stunnel process, process name: %s.",
             state_pid,
             str(process_name) if process_name else "",
+        )
+        return False
+
+    # A zombie keeps its name until reaped, so the name alone is not enough.
+    if process_state in DEAD_RUN_STATES:
+        logging.debug(
+            "Process running on %s has exited, run state %s, for %s.",
+            state_pid,
+            str(process_state),
+            state_file,
         )
         return False
 
@@ -998,6 +1078,22 @@ def get_system_release_version():
         logging.debug("Unable to read %s", OS_RELEASE_PATH)
 
     return DEFAULT_UNKNOWN_VALUE
+
+
+# The installed watchdog is standalone and cannot import efs_utils_common.
+# Keep this parser aligned with platform_utils.get_linux_kernel_version.
+# Parse Linux kernel version from platform.release(), padding invalid or short
+# versions with zeroes so comparisons remain deterministic.
+def get_linux_kernel_version(desired_length):
+    release = platform.release()
+    version = []
+    try:
+        version = [int(v) for v in release.split("-", 1)[0].split(".")[:desired_length]]
+    except ValueError:
+        logging.warning("Failed to parse linux kernel version from %s", release)
+    for _ in range(len(version), desired_length):
+        version.append(0)
+    return version
 
 
 def find_command_path(command, install_method):
@@ -1316,19 +1412,30 @@ def check_efs_mounts(
             )
 
 
-#  This function serves as a safeguard mechanism specifically for Ubuntu 24,
-#  where the initial readahead setting might be overwritten due to system
-#  processes. It checks the current readahead value and updates it if necessary.
+# Only modify read_ahead_kb on Linux kernels affected by the 5.4+ NFS
+# readahead default change when optimization is explicitly enabled.
+def should_revise_readahead(config):
+    if platform.system() != "Linux":
+        return False
+
+    if (
+        get_linux_kernel_version(len(NFS_READAHEAD_OPTIMIZE_LINUX_KERNEL_MIN_VERSION))
+        < NFS_READAHEAD_OPTIMIZE_LINUX_KERNEL_MIN_VERSION
+    ):
+        return False
+
+    return get_boolean_config_item_value(
+        config,
+        MOUNT_CONFIG_SECTION,
+        OPTIMIZE_READAHEAD_ITEM,
+        default_value=False,
+    )
+
+
+# Periodically correct readahead drift after the mount-time write.
 def verify_and_update_readahead(mount, config, mount_info):
     try:
-        system_release_version = get_system_release_version()
-        if UBUNTU_24_RELEASE not in system_release_version:
-            return
-
-        should_optimize_readahead = get_boolean_config_item_value(
-            config, MOUNT_CONFIG_SECTION, OPTIMIZE_READAHEAD_ITEM, default_value=False
-        )
-        if not should_optimize_readahead:
+        if not should_revise_readahead(config):
             return
 
         # Use subprocess with timeout to get device number to avoid hanging on os.stat()
@@ -1606,20 +1713,69 @@ def read_config(config_file=CONFIG_FILE):
     return p
 
 
+def parse_credentials_expiration(expiration):
+    """Parse a credential "Expiration" ISO-8601 string into a tz-aware UTC datetime, or None.
+
+    Values are validated at the persist sites, so a failure here (absent or corrupted state) falls
+    back to the fixed interval silently.
+    """
+    if not expiration:
+        return None
+    try:
+        return datetime.strptime(
+            expiration, CREDENTIALS_EXPIRATION_DATETIME_FORMAT
+        ).replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def get_certificate_refresh_deadline(
+    certificate_creation_time,
+    renewal_interval_secs,
+    credentials_expiration,
+):
+    """Return the UTC datetime at which the certificate should next be refreshed.
+
+    The deadline is the earliest of:
+      - the fixed renewal interval,
+      - the credential's expiration, less the safety margin, and
+      - the certificate's own NOT_AFTER lifetime, less the safety margin.
+    """
+    safety_margin = timedelta(minutes=CERT_EXPIRATION_SAFETY_MARGIN_MIN)
+    interval_deadline = certificate_creation_time + timedelta(
+        seconds=renewal_interval_secs
+    )
+    cert_ttl_deadline = (
+        certificate_creation_time + timedelta(hours=NOT_AFTER_HOURS) - safety_margin
+    )
+    deadline = min(interval_deadline, cert_ttl_deadline)
+    if credentials_expiration is not None:
+        deadline = min(deadline, credentials_expiration - safety_margin)
+    return deadline
+
+
 def check_certificate(
     config, state, state_file_dir, state_file, service, base_path=STATE_FILE_DIR
 ):
     certificate_creation_time = datetime.strptime(
         state["certificateCreationTime"], CERT_DATETIME_FORMAT
-    )
+    ).replace(tzinfo=timezone.utc)
     certificate_exists = os.path.isfile(state["certificate"])
     certificate_renewal_interval_secs = (
         get_certificate_renewal_interval_mins(config) * 60
     )
+    now = get_utc_now()
+
     # creation instead of NOT_BEFORE datetime is used for refresh of cert because NOT_BEFORE derives from creation datetime
-    should_refresh_cert = (
-        get_utc_now() - certificate_creation_time.replace(tzinfo=timezone.utc)
-    ).total_seconds() > certificate_renewal_interval_secs
+    credentials_expiration = parse_credentials_expiration(
+        state.get("certificateExpirationTime")
+    )
+    refresh_deadline = get_certificate_refresh_deadline(
+        certificate_creation_time,
+        certificate_renewal_interval_secs,
+        credentials_expiration,
+    )
+    should_refresh_cert = now > refresh_deadline
 
     if certificate_exists and not should_refresh_cert:
         return
@@ -1641,21 +1797,38 @@ def check_certificate(
         logging.debug(
             "Refreshing self-signed certificate (at %s)" % state["certificate"]
         )
+        interval_deadline = certificate_creation_time + timedelta(
+            seconds=certificate_renewal_interval_secs
+        )
+        if refresh_deadline < interval_deadline:
+            logging.debug(
+                "Refreshing %s early: scheduled deadline %s precedes the fixed-interval deadline %s",
+                state["certificate"],
+                refresh_deadline.strftime(CREDENTIALS_EXPIRATION_DATETIME_FORMAT),
+                interval_deadline.strftime(CREDENTIALS_EXPIRATION_DATETIME_FORMAT),
+            )
 
     credentials_source = state.get("awsCredentialsMethod")
-    updated_certificate_creation_time = recreate_certificate(
-        config,
-        state["mountStateDir"],
-        state["commonName"],
-        state["fsId"],
-        credentials_source,
-        ap_state,
-        state["region"],
-        service,
-        base_path=base_path,
+    updated_certificate_creation_time, updated_credentials_expiration = (
+        recreate_certificate(
+            config,
+            state["mountStateDir"],
+            state["commonName"],
+            state["fsId"],
+            credentials_source,
+            ap_state,
+            state["region"],
+            service,
+            base_path=base_path,
+        )
     )
     if updated_certificate_creation_time:
         state["certificateCreationTime"] = updated_certificate_creation_time
+        # updated_credentials_expiration is pre-validated by create_ca_conf: valid ISO-8601 or None.
+        if updated_credentials_expiration:
+            state["certificateExpirationTime"] = updated_credentials_expiration
+        else:
+            state.pop("certificateExpirationTime", None)
         rewrite_state_file(state, state_file_dir, state_file)
 
         # send SIGHUP to force a reload of the configuration file to trigger the stunnel process to notice the new certificate
@@ -1775,7 +1948,7 @@ def recreate_certificate(
         create_public_key(private_key, public_key)
 
     client_info = get_client_info(config)
-    config_body = create_ca_conf(
+    config_body, credentials_expiration = create_ca_conf(
         config,
         certificate_config,
         common_name,
@@ -1792,7 +1965,7 @@ def recreate_certificate(
 
     if not config_body:
         logging.error("Cannot recreate self-signed certificate")
-        return None
+        return None, None
 
     create_certificate_signing_request(
         certificate_config, private_key, certificate_signing_request
@@ -1812,7 +1985,7 @@ def recreate_certificate(
         )
     )
     subprocess_call(cmd, "Failed to create self-signed client-side certificate")
-    return current_time.strftime(CERT_DATETIME_FORMAT)
+    return current_time.strftime(CERT_DATETIME_FORMAT), credentials_expiration
 
 
 def get_private_key_path():
@@ -1906,7 +2079,13 @@ def create_ca_conf(
     ap_id=None,
     client_info=None,
 ):
-    """Populate ca/req configuration file with fresh configurations at every mount since SigV4 signature can change"""
+    """Populate ca/req configuration file with fresh configurations at every mount since SigV4 signature can change
+
+    Returns a (full_config_body, credentials_expiration) tuple. credentials_expiration is the
+    credential's "Expiration" as a valid ISO-8601 string when the source provides a usable one,
+    else None (absent, or present but unparseable). It lets the caller schedule the next refresh
+    before the embedded credential expires. On failure returns (None, None).
+    """
     public_key_path = os.path.join(directory, "publicKey.pem")
     security_credentials = (
         get_aws_security_credentials(config, credentials_source, region)
@@ -1919,7 +2098,39 @@ def create_ca_conf(
             "Failed to retrieve AWS security credentials using lookup method: %s",
             credentials_source,
         )
-        return None
+        return None, None
+
+    credentials_expiration = (
+        security_credentials.get("Expiration") if security_credentials else None
+    )
+
+    # Validate the expiration once, here, so the caller can persist the returned value without
+    # re-checking it: it is normalized to a valid ISO-8601 string or None.
+    if credentials_expiration:
+        parsed_expiration = parse_credentials_expiration(credentials_expiration)
+        if parsed_expiration is None:
+            # Present but unparseable: mint the cert, but drop the value so the refresh falls back
+            # to the fixed interval (can't schedule against a timestamp we can't read).
+            logging.warning(
+                'Credential expiration "%s" is not valid ISO-8601; certificate refresh will fall '
+                "back to the fixed interval",
+                credentials_expiration,
+            )
+            credentials_expiration = None
+        elif parsed_expiration <= date:
+            # A cert minted from already-expired credentials would be rejected on the next
+            # handshake; treat expired creds as a fetch failure rather than minting a doomed cert.
+            logging.error(
+                "Credential source returned already-expired credentials (expired %s); not "
+                "generating a certificate",
+                credentials_expiration,
+            )
+            return None, None
+    elif security_credentials:
+        logging.debug(
+            "No expiration available for these credentials; certificate refresh falls back to "
+            "the fixed interval"
+        )
 
     ca_extension_body = ca_extension_builder(
         ap_id, security_credentials, fs_id, client_info
@@ -1943,7 +2154,7 @@ def create_ca_conf(
             "Failed to create AWS SigV4 signature section for OpenSSL config. Public Key path: %s",
             public_key_path,
         )
-        return None
+        return None, None
     efs_client_info_body = efs_client_info_builder(client_info) if client_info else ""
     full_config_body = CA_CONFIG_BODY % (
         directory,
@@ -1957,7 +2168,7 @@ def create_ca_conf(
     with open(config_path, "w") as f:
         f.write(full_config_body)
 
-    return full_config_body
+    return full_config_body, credentials_expiration
 
 
 def ca_extension_builder(ap_id, security_credentials, fs_id, client_info):
@@ -2026,7 +2237,7 @@ def subprocess_call(cmd, error_message):
     process = subprocess.Popen(
         cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True
     )
-    (output, err) = process.communicate()
+    output, err = process.communicate()
     rc = process.poll()
     if rc != 0:
         logging.debug(
@@ -2283,16 +2494,60 @@ def get_utc_now():
     return datetime.now(timezone.utc)
 
 
-def check_process_name(pid):
-    if not check_if_running_on_macos():
-        cmd = ["cat", "/proc/{pid}/cmdline".format(pid=pid)]
-    else:
-        cmd = ["ps", "-p", str(pid), "-o", "command="]
+def check_process_name_and_state(pid):
+    """Return `(name, state)` for `pid`, or `(None, None)` if it cannot be read.
 
+    Reads /proc/<pid>/stat, never /proc/<pid>/cmdline: a cmdline read enters the
+    target's address space and can block forever on a wedged process. `state` is
+    the run state, and is None on macOS, which has no procfs.
+    """
+    if check_if_running_on_macos():
+        return _check_process_name_and_state_macos(pid)
+
+    try:
+        with open(PROC_STAT_PATH_FORMAT % pid, "rb") as f:
+            stat_line = f.read()
+    except OSError as e:
+        # The process exited, or the pid was never valid.
+        logging.debug("Could not read the stat file of pid %s: %s", pid, e)
+        return None, None
+
+    # Field 2 is the name in parentheses and may contain parentheses itself, so it
+    # ends at the LAST ')'. Splitting on the first is spoofable via prctl.
+    name_start = stat_line.find(b"(")
+    name_end = stat_line.rfind(b")")
+    if name_start == -1 or name_end < name_start:
+        logging.debug(
+            "Unexpected content in the stat file of pid %s: %s", pid, stat_line
+        )
+        return None, None
+
+    # Field 3 is the run state: the first token after the name, taken by splitting
+    # rather than a fixed offset so it does not depend on the kernel's spacing.
+    fields_after_name = stat_line[name_end + 1 :].split()
+    state = fields_after_name[0] if fields_after_name else None
+
+    return stat_line[name_start + 1 : name_end], state
+
+
+def _check_process_name_and_state_macos(pid):
     p = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True
+        ["ps", "-p", str(pid), "-o", "command="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
     )
-    return p.communicate()[0]
+    try:
+        return p.communicate(timeout=PROCESS_NAME_TIMEOUT_SEC)[0], None
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        logging.warning(
+            "Timed out after %ss looking up the name of process %s",
+            PROCESS_NAME_TIMEOUT_SEC,
+            pid,
+        )
+        return None, None
 
 
 def check_if_running_on_macos():
@@ -2365,9 +2620,14 @@ def clean_up_previous_tunnel_pids(state_file_dir=STATE_FILE_DIR):
                 logging.debug("No PID found in state file %s", state_file)
                 continue
 
-            out = check_process_name(pid)
+            process_name, process_state = check_process_name_and_state(pid)
 
-            if out and ("stunnel" in str(out) or "efs-proxy" in str(out)):
+            # A zombie's name still matches, so it must not count as active.
+            if (
+                process_name
+                and ("stunnel" in str(process_name) or "efs-proxy" in str(process_name))
+                and process_state not in DEAD_RUN_STATES
+            ):
                 logging.debug(
                     "PID %s in state file %s is active. Skipping clean up",
                     pid,

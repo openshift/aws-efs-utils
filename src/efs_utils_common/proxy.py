@@ -24,6 +24,7 @@ except ImportError:
 from efs_utils_common.aws_credentials import (
     get_aws_profile,
     get_aws_security_credentials,
+    is_valid_credentials_expiration,
 )
 from efs_utils_common.certificate_utils import create_certificate, get_private_key_path
 from efs_utils_common.config_utils import (
@@ -191,6 +192,12 @@ def serialize_stunnel_config(config, header=None):
 def add_tunnel_ca_options(efs_config, config, options, region):
     if "cafile" in options:
         stunnel_cafile = options["cafile"]
+        if not stunnel_cafile:
+            fatal_error(
+                "The cafile mount option requires a path to a CA certificate file",
+                "cafile= was passed with an empty value. Specify a valid path, "
+                "e.g. -o tls,cafile=/path/to/ca.pem, or omit cafile to use the default EFS CA.",
+            )
     else:
         try:
             config_section = get_config_section(config, region)
@@ -642,25 +649,35 @@ def start_watchdog(init_system):
             logging.debug("%s is already running", WATCHDOG_SERVICE)
 
     elif init_system == "launchd":
-        rc = subprocess.Popen(
-            ["sudo", "launchctl", "list", WATCHDOG_SERVICE],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        rc = subprocess.call(
+            ["launchctl", "list", WATCHDOG_SERVICE],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             close_fds=True,
         )
-        if rc != 0:
+        if rc == 0:
+            logging.debug("%s is already running", WATCHDOG_SERVICE)
+        else:
             if not os.path.exists(WATCHDOG_SERVICE_PLIST_PATH):
                 fatal_error(
-                    "Watchdog plist file missing. Copy the watchdog plist file in directory /Library/LaunchAgents"
+                    "Watchdog plist file missing. Copy the watchdog plist file to /Library/LaunchDaemons/"
                 )
-            subprocess.Popen(
-                ["sudo", "launchctl", "load", WATCHDOG_SERVICE_PLIST_PATH],
+                return
+
+            logging.debug("Loading watchdog from %s", WATCHDOG_SERVICE_PLIST_PATH)
+            rc = subprocess.call(
+                ["launchctl", "load", WATCHDOG_SERVICE_PLIST_PATH],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 close_fds=True,
             )
-        else:
-            logging.debug("%s is already running", WATCHDOG_SERVICE)
+            if rc != 0:
+                fatal_error(
+                    "Failed to load watchdog plist %s (exit code %d)"
+                    % (WATCHDOG_SERVICE_PLIST_PATH, rc)
+                )
+                return
+            logging.debug("Loaded watchdog from %s", WATCHDOG_SERVICE_PLIST_PATH)
 
     else:
         error_message = 'Could not start %s, unrecognized init system "%s"' % (
@@ -748,6 +765,27 @@ def bootstrap_proxy(
                     logging.debug(
                         "AWS credentials source used for IAM authentication: %s",
                         credentials_source,
+                    )
+
+                # Persist the credential expiration so the watchdog can schedule refresh
+                # ahead of it.
+                expiration = (
+                    security_credentials.get("Expiration")
+                    if security_credentials
+                    else None
+                )
+                if not expiration:
+                    logging.debug(
+                        "No credential expiration available; the certificate will refresh on the "
+                        "fixed tls_cert_renewal_interval_min interval"
+                    )
+                elif is_valid_credentials_expiration(expiration):
+                    cert_details["certificateExpirationTime"] = expiration
+                else:
+                    logging.warning(
+                        'Credential expiration "%s" is not valid ISO-8601; the watchdog will '
+                        "fall back to the tls_cert_renewal_interval_min fixed interval",
+                        expiration,
                     )
 
             # Access points must be mounted over TLS

@@ -9,6 +9,7 @@
 
 import logging
 import os
+from datetime import datetime
 
 try:
     from configparser import NoOptionError, NoSectionError
@@ -51,6 +52,25 @@ from efs_utils_common.constants import (
 )
 from efs_utils_common.error_reporting import fatal_error
 from efs_utils_common.metadata import get_dns_name_suffix, url_request_helper
+
+# Format of the "Expiration" field in IMDS / ECS / STS credential responses.
+CREDENTIALS_EXPIRATION_DATETIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def is_valid_credentials_expiration(expiration):
+    """Return True if the credential "Expiration" is a parseable ISO-8601 timestamp.
+
+    Credential expirations are whole-second ISO-8601 UTC (e.g. "2019-10-25T21:17:24Z"). Callers
+    validate before persisting the value into the mount state file so the watchdog only reads
+    values it can schedule against.
+    """
+    if not expiration:
+        return False
+    try:
+        datetime.strptime(expiration, CREDENTIALS_EXPIRATION_DATETIME_FORMAT)
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
 def get_aws_security_credentials(
@@ -248,6 +268,7 @@ def get_aws_security_credentials_from_webidentity(
                 "AccessKeyId": creds["AccessKeyId"],
                 "SecretAccessKey": creds["SecretAccessKey"],
                 "Token": creds["SessionToken"],
+                "Expiration": creds.get("Expiration"),
             }, "webidentity:" + ",".join([role_arn, token_file])
 
     # Fail if credentials cannot be fetched from the given aws_creds_uri
@@ -398,7 +419,8 @@ def botocore_credentials_helper(awsprofile):
     session.set_config_variable("profile", awsprofile)
 
     try:
-        frozen_credentials = session.get_credentials().get_frozen_credentials()
+        creds_object = session.get_credentials()
+        frozen_credentials = creds_object.get_frozen_credentials()
     except ProfileNotFound as e:
         fatal_error(
             "%s, please add the [profile %s] section in the aws config file following %s and %s."
@@ -408,6 +430,14 @@ def botocore_credentials_helper(awsprofile):
     credentials["AccessKeyId"] = frozen_credentials.access_key
     credentials["SecretAccessKey"] = frozen_credentials.secret_key
     credentials["Token"] = frozen_credentials.token
+
+    # Surface the expiration for temporary (assumed-role/session) profiles so the watchdog can
+    # refresh ahead of it. botocore exposes it only via the private _expiry_time; static profiles have none.
+    expiry_time = getattr(creds_object, "_expiry_time", None)
+    if isinstance(expiry_time, datetime):
+        credentials["Expiration"] = expiry_time.strftime(
+            CREDENTIALS_EXPIRATION_DATETIME_FORMAT
+        )
     return credentials
 
 
