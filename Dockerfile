@@ -22,8 +22,11 @@ COPY ./dist/efs-utils.conf /etc/amazon/efs/efs-utils.conf
 RUN chmod 444 /etc/amazon/efs/efs-utils.conf
 COPY ./src/mount_efs/__init__.py /sbin/mount.efs
 RUN chmod 755 /sbin/mount.efs
+COPY ./src/mount_s3files/__init__.py /sbin/mount.s3files
+RUN chmod 755 /sbin/mount.s3files
 COPY ./src/efs_utils_common /sbin/efs_utils_common
 COPY ./src/mount_efs /sbin/mount_efs
+COPY ./src/mount_s3files /sbin/mount_s3files
 COPY ./src/watchdog/__init__.py /usr/bin/amazon-efs-mount-watchdog
 RUN chmod 755 /usr/bin/amazon-efs-mount-watchdog
 
@@ -48,3 +51,5 @@ import mount_efs.dns_resolver
 PY
 
 RUN /sbin/mount.efs --version
+RUN /sbin/mount.s3files --version
+
