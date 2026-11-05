@@ -21,6 +21,7 @@ Efs-utils for EFS and S3 file systems are supported on the following Linux distr
 | Ubuntu 20.04         | `deb` | `systemd` |
 | Ubuntu 22.04         | `deb` | `systemd` |
 | Ubuntu 24.04         | `deb` | `systemd` |
+| Ubuntu 26.04         | `deb` | `systemd` |
 | OpenSUSE Leap        | `rpm` | `systemd` |
 | SLES 15              | `rpm` | `systemd` |
 
@@ -32,6 +33,9 @@ Efs-utils for EFS file systems is supported on the following macOS distributions
 | macOS Sonoma   | `launchd`     |
 | macOS Sequoia  | `launchd`     |
 | macOS Tahoe    | `launchd`     |
+
+Only the latest version of efs-utils will continue to receive new features, fixes, and security patches. Please update
+to the latest version to receive continued support.
 
 ## README Contents
 - [Installation](#installation)
@@ -83,7 +87,7 @@ You can use AWS Systems Manager Distributor to automatically install or update `
 
 ### Other Linux Distributions
 
-Building from source requires Rust 1.91.1+, Cargo, Go 1.17.13+, CMake 3.0+, GCC/G++, and Perl. See [INSTALL.md](INSTALL.md) for detailed build instructions for your distribution.
+Building from source requires Rust 1.94.1+, Cargo, Go 1.17.13+, CMake 3.5+, GCC/G++, and Perl. See [INSTALL.md](INSTALL.md) for detailed build instructions for your distribution.
 
 ### For macOS Tahoe, Sequoia, Sonoma, and Ventura distributions
 

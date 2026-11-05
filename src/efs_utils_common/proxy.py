@@ -17,9 +17,9 @@ import time
 from contextlib import contextmanager
 
 try:
-    from configparser import NoOptionError
+    from configparser import NoOptionError, NoSectionError
 except ImportError:
-    from ConfigParser import NoOptionError
+    from ConfigParser import NoOptionError, NoSectionError
 
 from efs_utils_common.aws_credentials import (
     get_aws_profile,
@@ -34,6 +34,7 @@ from efs_utils_common.config_utils import (
     is_ocsp_enabled,
 )
 from efs_utils_common.constants import (
+    CONFIG_CONTROL_CHAR_PATTERN,
     CONFIG_SECTION,
     DEFAULT_NFS_MOUNT_COMMAND_TIMEOUT_SEC,
     DEFAULT_PROXY_LOGGING_FILE_COUNT,
@@ -41,14 +42,19 @@ from efs_utils_common.constants import (
     DEFAULT_PROXY_LOGGING_MAX_BYTES,
     DEFAULT_STUNNEL_CAFILE,
     DEFAULT_STUNNEL_VERIFY_LEVEL,
+    DEFAULT_TIMEOUT,
     DEFAULT_UNKNOWN_VALUE,
+    EFS_PROXY_LISTEN_FD_OPTION,
     EFS_PROXY_NO_READ_BYPASS_OPTION,
     EFS_PROXY_TLS_OPTION,
+    EFS_PROXY_WORKER_THREADS_ITEM,
+    EFS_PROXY_WORKER_THREADS_OPTION,
     LOG_DIR,
     MOUNT_TYPE_S3FILES,
     PROXY_CONFIG_SECTION,
     SKIP_NO_SO_BINDTODEVICE_RELEASES,
     STATE_FILE_DIR,
+    USE_FIPS_ENDPOINT_STATE_KEY,
     VERSION,
     WATCHDOG_SERVICE,
     WATCHDOG_SERVICE_PLIST_PATH,
@@ -66,7 +72,13 @@ from efs_utils_common.metadata import (
     get_fips_config,
     get_target_region,
 )
-from efs_utils_common.network_utils import test_tlsport
+from efs_utils_common.network_utils import (
+    TUNNEL_LISTEN_ADDRESS,
+    process_listens_on_port,
+    procfs_available,
+    test_tlsport,
+    verify_tlsport_can_be_connected,
+)
 from efs_utils_common.platform_utils import (
     check_if_platform_is_mac,
     get_client_info,
@@ -127,6 +139,23 @@ def choose_tls_port_and_get_bind_sock(config, options, state_file_dir):
 
 
 def find_tls_port_in_range_and_get_bind_sock(ports_to_try, state_file_dir):
+    """
+    Return a socket bound to a TLS port that no other mount owns, or None.
+
+    A mount owns its port from the moment its probe socket binds until its state
+    file is removed: bootstrap_proxy writes the state file before it hands the probe
+    socket to efs-proxy or closes it for stunnel. Ports already assigned to a mount
+    are skipped without binding them, so that the probe does not hold a port its
+    owner's tunnel is about to bind. That check alone is not enough: another mount
+    can write its state file and release its probe between the check and the bind,
+    and the two mounts would then share the port. So the state files are checked
+    again while the port is held. Any mount that has released the port by then has
+    written its state file, and the second check sees it.
+
+    The probe binds TUNNEL_LISTEN_ADDRESS, the address the tunnel listens on and
+    mount.nfs4 connects to, rather than a name that might resolve elsewhere: efs-proxy
+    refuses an inherited socket bound to any other address.
+    """
     sock = socket.socket()
     for tls_port in ports_to_try:
         mount = find_existing_mount_using_tls_port(state_file_dir, tls_port)
@@ -139,11 +168,23 @@ def find_tls_port_in_range_and_get_bind_sock(ports_to_try, state_file_dir):
             continue
         try:
             logging.info("binding %s", tls_port)
-            sock.bind(("localhost", tls_port))
-            return sock
+            sock.bind((TUNNEL_LISTEN_ADDRESS, tls_port))
         except socket.error as e:
             logging.warning(e)
             continue
+
+        mount = find_existing_mount_using_tls_port(state_file_dir, tls_port)
+        if not mount:
+            return sock
+
+        logging.info(
+            "Releasing TLS port %s as it was assigned to %s while it was being bound",
+            tls_port,
+            mount,
+        )
+        # A bound socket cannot be bound again; release it and try the next port.
+        sock.close()
+        sock = socket.socket()
     sock.close()
     return None
 
@@ -172,6 +213,23 @@ def get_mount_specific_filename(fs_id, mountpoint, tls_port):
     )
 
 
+def _reject_control_chars(key, value):
+    """Reject a control char in any stunnel/efs-proxy config key or value.
+
+    Lines are written unescaped as "key = value", so a key or value must not
+    contain a newline or any other control character. Central backstop for every
+    value reaching the config, whatever its source.
+    """
+    for field in (str(key), str(value)):
+        if CONFIG_CONTROL_CHAR_PATTERN.search(field):
+            fatal_error(
+                "Refusing to write malformed stunnel config: option %r contains a "
+                "disallowed control character" % key,
+                "serialize_stunnel_config rejected a control character in key/value "
+                "for option %r" % key,
+            )
+
+
 def serialize_stunnel_config(config, header=None):
     lines = []
 
@@ -181,8 +239,10 @@ def serialize_stunnel_config(config, header=None):
     for k, v in config.items():
         if type(v) is list:
             for item in v:
+                _reject_control_chars(k, item)
                 lines.append("%s = %s" % (k, item))
         else:
+            _reject_control_chars(k, v)
             lines.append("%s = %s" % (k, v))
 
     return lines
@@ -545,21 +605,77 @@ def write_tunnel_state_file(
         "mount_time": time.time(),
         "mountpoint": mountpoint,
         "service_type": context.service,
+        # Lets the watchdog tell a mount still in progress from one whose
+        # mount helper died before renaming this file.
+        "writer_pid": os.getpid(),
+        "writer_start_time": get_process_start_time(os.getpid()),
     }
 
     if cert_details:
         state.update(cert_details)
 
-    with open(os.path.join(state_file_dir, state_file), "w") as f:
-        json.dump(state, f)
+    return rewrite_tunnel_state_file(state, state_file_dir, state_file)
 
-    return state_file
+
+# `ps -o lstart` is formatted with the caller's locale and time zone. Pin both so
+# the watchdog and mount.efs produce the same string for the same process.
+PS_LSTART_ENV = {"LC_ALL": "C", "TZ": "UTC", "PATH": "/bin:/usr/bin"}
+
+
+def get_process_start_time(pid):
+    """Return the start time of pid, or None if it is not running.
+
+    Linux: field 22 of /proc/<pid>/stat, clock ticks since boot. macOS: the
+    fixed-format `ps -o lstart` string. The watchdog compares it for equality.
+    """
+    if check_if_platform_is_mac():
+        p = subprocess.Popen(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            env=PS_LSTART_ENV,
+        )
+        try:
+            out = p.communicate(timeout=5)[0]
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            return None
+        return out.decode().strip() or None
+    try:
+        with open("/proc/%s/stat" % pid, "rb") as f:
+            stat_line = f.read()
+    except OSError:
+        return None
+    # The name in field 2 may contain spaces or parentheses; it ends at the last ")".
+    fields_after_name = stat_line[stat_line.rfind(b")") + 1 :].split()
+    try:
+        return int(fields_after_name[19])
+    except (IndexError, ValueError):
+        return None
 
 
 def rewrite_tunnel_state_file(state, state_file_dir, state_file):
-    with open(os.path.join(state_file_dir, state_file), "w") as f:
-        json.dump(state, f)
+    # Write then rename so a kill mid-write cannot leave a truncated record. The
+    # scratch name matches none of the state dir scans (fs-, ~fs-, .<port>).
+    state_file_path = os.path.join(state_file_dir, state_file)
+    scratch_path = os.path.join(state_file_dir, "~" + state_file + ".tmp")
+    try:
+        with open(scratch_path, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        _remove_scratch(scratch_path)
+        raise
+    os.rename(scratch_path, state_file_path)
     return state_file
+
+
+def _remove_scratch(scratch_path):
+    try:
+        os.remove(scratch_path)
+    except OSError:
+        pass
 
 
 def update_tunnel_temp_state_file_with_tunnel_pid(
@@ -568,6 +684,8 @@ def update_tunnel_temp_state_file_with_tunnel_pid(
     with open(os.path.join(state_file_dir, temp_tls_state_file), "r") as f:
         state = json.load(f)
     state["pid"] = stunnel_pid
+    # Lets the watchdog tell this proxy from another process that reused its pid.
+    state["pid_start_time"] = get_process_start_time(stunnel_pid)
     temp_tls_state_file = rewrite_tunnel_state_file(
         state, state_file_dir, temp_tls_state_file
     )
@@ -585,6 +703,128 @@ def test_tunnel_process(tunnel_proc, fs_id):
             "enable stunnel debug log in efs-utils config file and retry the mount to capture more info."
             % (tunnel_proc.returncode, err.strip()),
         )
+
+
+# How long to wait for the tunnel process (efs-proxy or stunnel) to listen on its port. When it is still not
+# listening after this, the mount fails if another process answers on the port, and
+# otherwise goes ahead as it did before this wait existed. A healthy tunnel listens well
+# within this; a tunnel that lost its port exits as soon as its bind fails. Only a tunnel
+# that is alive but slow to start waits this long, so it is generous enough for a
+# heavily loaded host.
+TUNNEL_LISTEN_TIMEOUT_SEC = 30
+
+
+# How long to keep checking a tunnel whose listener cannot be read from procfs before
+# relying on the connect check. A refused read is ambiguous, so this gives a tunnel that
+# lost its port the time to finish exiting, which the liveness check then sees. The
+# refusal comes from a security policy or hidepid, not from the process exiting: an
+# exiting process's /proc/<pid>/fd (mode 0500) moves to root, and mount.efs is root.
+TUNNEL_OWNERSHIP_UNREADABLE_GRACE_SEC = 1
+
+
+def _tunnel_owns_port(tunnel_proc, fs_id, tls_port):
+    """
+    process_listens_on_port for the tunnel, waiting out an ambiguous None.
+
+    Returns True or False, or None when ownership cannot be read: the host has no
+    procfs, or reads are refused for the whole grace period while the tunnel stays
+    alive. Fatal if the tunnel exits meanwhile.
+    """
+    listening = process_listens_on_port(tunnel_proc.pid, tls_port)
+    if listening is not None or not procfs_available():
+        return listening
+    grace_deadline = time.monotonic() + TUNNEL_OWNERSHIP_UNREADABLE_GRACE_SEC
+    while listening is None and time.monotonic() < grace_deadline:
+        time.sleep(DEFAULT_TIMEOUT)
+        # Fatal, before mount.nfs4 has run, if the tunnel was exiting.
+        test_tunnel_process(tunnel_proc, fs_id)
+        listening = process_listens_on_port(tunnel_proc.pid, tls_port)
+    return listening
+
+
+def _tls_port_answers(tls_port, options):
+    if "netns" not in options:
+        return verify_tlsport_can_be_connected(tls_port)
+    with NetNS(nspath=options["netns"]):
+        return verify_tlsport_can_be_connected(tls_port)
+
+
+def wait_for_tunnel_to_listen(tunnel_proc, fs_id, options):
+    """
+    Wait until the tunnel process (efs-proxy or stunnel) started for this mount
+    listens on its port, so that the NFS mount is attached to this mount's own tunnel.
+
+    A successful connect to the port is not enough. If another process holds the
+    port, the connect succeeds even though this mount's tunnel failed to bind and
+    exited, and the NFS mount would be attached to the other process. When the
+    listener's owner can be read from procfs, wait for this tunnel to own it, and
+    fail the mount before running mount.nfs4 if the tunnel exits first. Elsewhere,
+    fall back to the connect check.
+    """
+    tls_port = int(options["tlsport"])
+    deadline = time.monotonic() + TUNNEL_LISTEN_TIMEOUT_SEC
+    while True:
+        # Fatal, before mount.nfs4 has run, if the tunnel has already exited.
+        test_tunnel_process(tunnel_proc, fs_id)
+
+        listening = _tunnel_owns_port(tunnel_proc, fs_id, tls_port)
+        if listening is None:
+            logging.debug(
+                "Cannot read the listener of port %s, falling back to a connect check",
+                tls_port,
+            )
+            if "netns" not in options:
+                test_tlsport(tls_port)
+            else:
+                with NetNS(nspath=options["netns"]):
+                    test_tlsport(tls_port)
+            return
+
+        if listening:
+            logging.debug(
+                "TLS tunnel pid %d is listening on port %s", tunnel_proc.pid, tls_port
+            )
+            return
+
+        if time.monotonic() >= deadline:
+            # This tunnel is not listening, so anything that answers on the port is
+            # another process, and mount.nfs4 would be attached to it. The connect and
+            # the procfs read above are separate, so a tunnel that started listening in
+            # between would answer too: check its listener once more first.
+            if _tls_port_answers(tls_port, options):
+                owns_port = _tunnel_owns_port(tunnel_proc, fs_id, tls_port)
+                if owns_port:
+                    logging.debug(
+                        "TLS tunnel pid %d is listening on port %s",
+                        tunnel_proc.pid,
+                        tls_port,
+                    )
+                    return
+                if owns_port is None:
+                    # Ownership can no longer be read; as in the loop, rely on the
+                    # connect check rather than claim the port is held by another
+                    # process.
+                    logging.debug(
+                        "Cannot read the listener of port %s, relying on the connect check",
+                        tls_port,
+                    )
+                    return
+                fatal_error(
+                    "Failed to mount %s: port %s is held by another process. Retry the mount."
+                    % (fs_id, tls_port),
+                    "TLS tunnel pid %d is not listening on port %s after %s sec, and another "
+                    "process accepts connections on it"
+                    % (tunnel_proc.pid, tls_port, TUNNEL_LISTEN_TIMEOUT_SEC),
+                )
+            logging.warning(
+                "TLS tunnel pid %d is not listening on port %s after %s sec, continuing with the mount",
+                tunnel_proc.pid,
+                tls_port,
+                TUNNEL_LISTEN_TIMEOUT_SEC,
+            )
+            return
+
+        time.sleep(DEFAULT_TIMEOUT)
 
 
 def poll_tunnel_process(tunnel_proc, fs_id, mount_completed):
@@ -699,6 +939,100 @@ def tls_enabled(options):
     return "tls" in options
 
 
+def get_efs_proxy_worker_threads(config):
+    """Return the configured efs-proxy worker-thread count, or None when unset.
+
+    Checks only what the config file can settle: that the value is an integer,
+    and that it is at least 1. A bad value is fatal rather than defaulted,
+    because a caller who set the item to bound thread usage must not silently get
+    the unbounded default. The upper bound -- not exceeding the parallelism the
+    proxy actually has -- is efs-proxy's, in `validate_worker_threads`.
+
+    An empty value is treated as unset, so a half-uncommented line does not fail
+    a mount.
+    """
+    try:
+        raw_value = config.get(CONFIG_SECTION, EFS_PROXY_WORKER_THREADS_ITEM)
+    except (NoOptionError, NoSectionError):
+        return None
+
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return None
+
+    range_help = (
+        "Expected a positive integer no greater than the number of CPUs "
+        "available to this host, or remove the item to use one worker thread per "
+        "available CPU."
+    )
+
+    try:
+        worker_threads = int(raw_value)
+    except ValueError:
+        fatal_error(
+            'Invalid value "%s" for %s in section %s of %s. %s'
+            % (
+                raw_value,
+                EFS_PROXY_WORKER_THREADS_ITEM,
+                CONFIG_SECTION,
+                get_config_file_path(),
+                range_help,
+            )
+        )
+
+    if worker_threads < 1:
+        fatal_error(
+            "Invalid value %d for %s in section %s of %s. %s"
+            % (
+                worker_threads,
+                EFS_PROXY_WORKER_THREADS_ITEM,
+                CONFIG_SECTION,
+                get_config_file_path(),
+                range_help,
+            )
+        )
+
+    return worker_threads
+
+
+def start_tunnel_process(tunnel_args, efs_proxy_enabled, listen_sock=None):
+    """
+    Start efs-proxy or stunnel with `tunnel_args`.
+
+    With `listen_sock`, a socket bound to the proxy's listen port, the socket is passed to
+    efs-proxy as an inherited file descriptor named by --listen-fd, and this process's copy is
+    closed once efs-proxy has started. The flag is added here only: `tunnel_args` is also the
+    command saved in the state file, which the watchdog runs to restart a dead proxy, and a
+    restarted proxy has no socket to inherit, so it binds the port itself.
+    """
+    popen_args = list(tunnel_args)
+    pass_fds = ()
+    if listen_sock is not None:
+        listen_fd = listen_sock.fileno()
+        popen_args += [EFS_PROXY_LISTEN_FD_OPTION, str(listen_fd)]
+        pass_fds = (listen_fd,)
+
+    # launch the tunnel in a process group so if it has any child processes, they can be killed easily by the mount watchdog
+    logging.info(
+        'Starting %s: "%s"',
+        "efs-proxy" if efs_proxy_enabled else "stunnel",
+        " ".join(popen_args),
+    )
+    try:
+        return subprocess.Popen(
+            popen_args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            preexec_fn=os.setsid,
+            close_fds=True,
+            pass_fds=pass_fds,
+        )
+    finally:
+        if listen_sock is not None:
+            # efs-proxy holds its own reference to the socket now, or failed to start.
+            listen_sock.close()
+
+
 @contextmanager
 def bootstrap_proxy(
     config,
@@ -724,6 +1058,14 @@ def bootstrap_proxy(
 
     This function will yield a handle on the proxy process, whether it's efs-proxy or stunnel.
     """
+
+    # Read this before anything is created. It is the only fatal_error between
+    # choosing the port and writing the state file, and the watchdog's cleanup
+    # (cleanup_mount_state_if_stunnel_not_running) is keyed off state files -- so
+    # failing later would orphan the certificate directory and the proxy config
+    # in /var/run/efs on every attempt, which accumulates under a CSI retry loop.
+    # A config lookup is cheap, so failing fast here costs nothing.
+    efs_proxy_worker_threads = get_efs_proxy_worker_threads(config)
 
     proxy_listen_sock = choose_tls_port_and_get_bind_sock(
         config, options, state_file_dir
@@ -762,6 +1104,9 @@ def bootstrap_proxy(
 
                 if credentials_source:
                     cert_details["awsCredentialsMethod"] = credentials_source
+                    # Recorded so the watchdog refreshes through this mount's STS
+                    # endpoint: it does not inherit this process's AWS_USE_FIPS_ENDPOINT.
+                    cert_details[USE_FIPS_ENDPOINT_STATE_KEY] = get_fips_config(config)
                     logging.debug(
                         "AWS credentials source used for IAM authentication: %s",
                         credentials_source,
@@ -857,6 +1202,10 @@ def bootstrap_proxy(
                 or MountContext().mount_type != MOUNT_TYPE_S3FILES
             ):
                 tunnel_args.append(EFS_PROXY_NO_READ_BYPASS_OPTION)
+            if efs_proxy_worker_threads is not None:
+                tunnel_args.extend(
+                    [EFS_PROXY_WORKER_THREADS_OPTION, str(efs_proxy_worker_threads)]
+                )
         else:
             tunnel_args = [_stunnel_bin(), stunnel_config_file]
 
@@ -874,29 +1223,25 @@ def bootstrap_proxy(
             state_file_dir,
             cert_details=cert_details,
         )
-    finally:
-        # When choosing a TLS port for efs-proxy/stunnel to listen on, we open the port to ensure it is free.
-        # However, we must free it again so efs-proxy/stunnel can bind to it. We make sure to only free it after
-        # we write the temporary state file, which acts like a tlsport lock file. This ensures we don't encounter
-        # any race conditions when choosing tls ports during concurrent mounts.
+    except BaseException:
+        proxy_listen_sock.close()
+        raise
+
+    if efs_proxy_enabled:
+        # Hand the bound socket to efs-proxy, so the port stays bound from the moment it was
+        # chosen until efs-proxy exits and no other process can take it in between.
+        tunnel_proc = start_tunnel_process(
+            tunnel_args, efs_proxy_enabled, listen_sock=proxy_listen_sock
+        )
+    else:
+        # stunnel cannot take over a bound socket, so free the port for it to bind. This is done
+        # only after the temporary state file, which acts as a lock on the port, is written, so a
+        # concurrent mount that checks the state files skips this port.
         logging.debug(
             "Closing socket used to choose proxy listen port %s.", proxy_listen_port
         )
         proxy_listen_sock.close()
-
-    # launch the tunnel in a process group so if it has any child processes, they can be killed easily by the mount watchdog
-    logging.info(
-        'Starting %s: "%s"',
-        "efs-proxy" if efs_proxy_enabled else "stunnel",
-        " ".join(tunnel_args),
-    )
-    tunnel_proc = subprocess.Popen(
-        tunnel_args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        preexec_fn=os.setsid,
-        close_fds=True,
-    )
+        tunnel_proc = start_tunnel_process(tunnel_args, efs_proxy_enabled)
     try:
         logging.info(
             "Started %s, pid: %d",
@@ -908,16 +1253,20 @@ def bootstrap_proxy(
             temp_tls_state_file, state_file_dir, tunnel_proc.pid
         )
 
-        if "netns" not in options:
-            test_tlsport(options["tlsport"])
-        else:
-            with NetNS(nspath=options["netns"]):
-                test_tlsport(options["tlsport"])
+        wait_for_tunnel_to_listen(tunnel_proc, fs_id, options)
         yield tunnel_proc
     finally:
         # The caller of this function should use this function in the context of a `with` statement
         # so that the state file is correctly renamed.
-        os.rename(
-            os.path.join(state_file_dir, temp_tls_state_file),
-            os.path.join(state_file_dir, temp_tls_state_file[1:]),
-        )
+        temp_path = os.path.join(state_file_dir, temp_tls_state_file)
+        final_path = os.path.join(state_file_dir, temp_tls_state_file[1:])
+        try:
+            os.rename(temp_path, final_path)
+        except FileNotFoundError:
+            # The watchdog may have finalized it first.
+            if not os.path.exists(final_path):
+                raise
+            logging.info(
+                "State file %s was already finalized by the watchdog",
+                temp_tls_state_file[1:],
+            )

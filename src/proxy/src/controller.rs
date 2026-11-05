@@ -142,7 +142,24 @@ impl<S: ProxyStream> Controller<S> {
         let Ok(listener) = TcpListener::bind(listen_addr).await else {
             panic!("Failed to bind {}", listen_addr);
         };
+        Self::with_listener(
+            listener,
+            proxy_config,
+            partition_finder,
+            status_reporter,
+            cw_publisher,
+        )
+    }
 
+    /// Build a controller around a listener the caller already holds, such as a
+    /// socket inherited from the mount helper (see `inherited_listener`).
+    pub fn with_listener(
+        listener: TcpListener,
+        proxy_config: ProxyConfig,
+        partition_finder: Arc<impl PartitionFinder<S> + Sync + Send + 'static>,
+        status_reporter: StatusReporter,
+        cw_publisher: Option<Arc<dyn CloudWatchClient>>,
+    ) -> Self {
         Self {
             listener,
             partition_finder,
@@ -177,7 +194,8 @@ impl<S: ProxyStream> Controller<S> {
                         "Accepted new connection {:?}, {:?} ",
                         socket_addr, self.proxy_id
                     );
-                    configure_stream(client)
+                    // Loopback to the kernel NFS client — liveness is the NFS client's timeo/retrans job.
+                    configure_stream(client, false)
                 }
                 Err(e) => {
                     error!("Failed to establish connection to NFS client. {e}");
@@ -606,6 +624,67 @@ mod tests {
         let client = TcpStream::connect(addr).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn new_binds_listen_addr() {
+        let free_addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (_status_requester, status_reporter) = create_status_channel();
+
+        let controller = Controller::<TcpStream>::new(
+            &free_addr.to_string(),
+            ProxyConfig::default(),
+            Arc::new(MockPartitionFinder),
+            status_reporter,
+            None,
+        )
+        .await;
+
+        assert_eq!(free_addr, controller.listener.local_addr().unwrap());
+        assert_eq!(0, controller.restart_count);
+        assert_eq!(DEFAULT_SCALE_UP_CONFIG, controller.scale_up_config);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "Failed to bind")]
+    async fn new_panics_when_listen_addr_is_in_use() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_status_requester, status_reporter) = create_status_channel();
+
+        Controller::<TcpStream>::new(
+            &taken.local_addr().unwrap().to_string(),
+            ProxyConfig::default(),
+            Arc::new(MockPartitionFinder),
+            status_reporter,
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn with_listener_serves_the_given_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_status_requester, status_reporter) = create_status_channel();
+        let publisher: Arc<dyn CloudWatchClient> = Arc::new(MockCloudWatchClient::new());
+
+        let controller = Controller::<TcpStream>::with_listener(
+            listener,
+            ProxyConfig::default(),
+            Arc::new(MockPartitionFinder),
+            status_reporter,
+            Some(publisher),
+        );
+
+        assert_eq!(addr, controller.listener.local_addr().unwrap());
+        assert!(controller.cw_publisher.is_some());
+        assert_eq!(0, controller.consecutive_connect_failures);
+        let _client = TcpStream::connect(addr).await.unwrap();
+        controller.listener.accept().await.unwrap();
     }
 
     #[tokio::test]

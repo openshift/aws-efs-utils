@@ -45,9 +45,15 @@ RUN /src/install-python-deps-ocp.sh
 # These import exists to fail image creation if one or more
 # libraries can't be imported for some reason.
 RUN PYTHONPATH=/sbin python3 - <<'PY'
+import botocore.credentials
+import botocore.httpsession
+import botocore.session
 import efs_utils_common.cloudwatch
 import efs_utils_common.config_utils
 import mount_efs.dns_resolver
+from efs_utils_common.metadata import BOTOCORE_PRESENT
+
+assert BOTOCORE_PRESENT, "botocore must be present and importable"
 PY
 
 RUN /sbin/mount.efs --version

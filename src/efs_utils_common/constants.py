@@ -11,7 +11,7 @@ import os
 import pwd
 import re
 
-VERSION = "3.3.2"
+VERSION = "3.3.5"
 
 AMAZON_LINUX_2_RELEASE_ID = "Amazon Linux release 2 (Karoo)"
 AMAZON_LINUX_2_PRETTY_NAME = "Amazon Linux 2"
@@ -81,7 +81,24 @@ REQUEST_PAYLOAD = ""
 
 CREDENTIALS_KEYS = ["AccessKeyId", "SecretAccessKey", "Token"]
 ECS_TASK_METADATA_API = "http://169.254.170.2"
-STS_ENDPOINT_URL_FORMAT = "https://sts.{}.{}/"
+STS_ENDPOINT_URL_FORMAT: str = "https://{host}.{region}.{dns_name_suffix}/"
+STS_HOST: str = "sts"
+STS_FIPS_HOST: str = "sts-fips"
+# GovCloud's standard STS endpoint is its FIPS endpoint; it has no sts-fips host.
+GOVCLOUD_REGION_PREFIX: str = "us-gov-"
+# The regions that have FIPS endpoints: the US (GovCloud included) and Canada,
+# per https://aws.amazon.com/compliance/fips/. Outside them a FIPS mount logs a
+# warning, and its web identity STS call uses the standard endpoint.
+# The annotation is a string: a module-level annotation is evaluated at import
+# time, and tuple[...] is not subscriptable before Python 3.9.
+FIPS_REGION_PREFIXES: "tuple[str, ...]" = (
+    "us-",
+    "ca-",
+)
+FIPS_REGIONS_HELP_URL: str = "https://aws.amazon.com/compliance/fips/"
+# The state file key that records whether a mount's STS calls use the FIPS endpoint.
+# The watchdog reads it through its own copy, kept in sync by value.
+USE_FIPS_ENDPOINT_STATE_KEY: str = "useFipsEndpoint"
 INSTANCE_METADATA_TOKEN_URL = "http://169.254.169.254/latest/api/token"
 INSTANCE_METADATA_SERVICE_URL = (
     "http://169.254.169.254/latest/dynamic/instance-identity/document/"
@@ -113,11 +130,33 @@ LEGACY_STUNNEL_MOUNT_OPTION = "stunnel"
 
 NFS_MOUNT_OPTION = "nfs"
 
+# Logged when a mount selects stunnel for a reason the caller can undo (macOS is silent).
+_LEGACY_STUNNEL_MODE_WARNING_PREFIX = (
+    "This mount uses legacy stunnel mode instead of efs-proxy. EFS recommends efs-proxy "
+    "for the latest feature and per-client throughput improvements. "
+)
+LEGACY_STUNNEL_MODE_WARNING_STUNNEL_OPTION = (
+    _LEGACY_STUNNEL_MODE_WARNING_PREFIX
+    + "Remove the 'stunnel' mount option to mount with efs-proxy."
+)
+LEGACY_STUNNEL_MODE_WARNING_OCSP = (
+    _LEGACY_STUNNEL_MODE_WARNING_PREFIX
+    + "efs-proxy does not support OCSP; to mount with efs-proxy, remove the 'ocsp' mount "
+    "option and set stunnel_check_cert_validity = false in %s." % CONFIG_FILE
+)
+
 NOT_BEFORE_MINS = 15
 NOT_AFTER_HOURS = 3
 
 EFS_PROXY_TLS_OPTION = "--tls"
 EFS_PROXY_NO_READ_BYPASS_OPTION = "--no-direct-s3-read"
+EFS_PROXY_WORKER_THREADS_OPTION = "--worker-threads"
+EFS_PROXY_LISTEN_FD_OPTION = "--listen-fd"
+
+# Optional [mount] item selecting how many Tokio worker threads each efs-proxy
+# process starts. Left unset, efs-proxy keeps its own default of one worker per
+# visible CPU, so omitting the item preserves existing behavior exactly.
+EFS_PROXY_WORKER_THREADS_ITEM = "efs_proxy_worker_threads"
 
 NON_NFS_OPTIONS = [
     "accesspoint",
@@ -158,6 +197,7 @@ MACOS_VENTURA_RELEASE = "macOS-13"
 MACOS_SONOMA_RELEASE = "macOS-14"
 MACOS_SEQUOIA_RELEASE = "macOS-15"
 MACOS_TAHOE_RELEASE = "macOS-26"
+MACOS_GOLDEN_GATE_RELEASE = "macOS-27"
 
 
 # Multiplier for max read ahead buffer size
@@ -174,11 +214,12 @@ SKIP_NO_SO_BINDTODEVICE_RELEASES = [
     MACOS_SONOMA_RELEASE,
     MACOS_SEQUOIA_RELEASE,
     MACOS_TAHOE_RELEASE,
+    MACOS_GOLDEN_GATE_RELEASE,
 ]
 
 MAC_OS_PLATFORM_LIST = ["darwin"]
-# MacOS Versions : Tahoe - 25.*, Sequoia - 24.*, Sonoma - 23.*, Ventura - 22.*, Monterey - 21.*, Big Sur - 20.*, Catalina - 19.*, Mojave - 18.*. Catalina and Mojave are not supported for now
-MAC_OS_SUPPORTED_VERSION_LIST = ["20", "21", "22", "23", "24", "25"]
+# MacOS Versions : Golden Gate - 27.*, Tahoe - 25.*, Sequoia - 24.*, Sonoma - 23.*, Ventura - 22.*, Monterey - 21.*, Big Sur - 20.*, Catalina - 19.*, Mojave - 18.*. Catalina and Mojave are not supported for now
+MAC_OS_SUPPORTED_VERSION_LIST = ["20", "21", "22", "23", "24", "25", "27"]
 
 AWS_FIPS_ENDPOINT_CONFIG_ENV = "AWS_USE_FIPS_ENDPOINT"
 ECS_URI_ENV = "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI"
@@ -199,6 +240,35 @@ PROXY_MODE_STUNNEL = "stunnel"
 
 AP_REGEX_PATTERN = re.compile("^fsap-[0-9a-f]{17}$")
 FS_ID_REGEX_PATTERN = re.compile("^(?P<fs_id>fs-[0-9a-f]+)$")
+
+# accessKeyId and sessionToken must match the STS credential grammar exactly:
+# one line, no whitespace or control characters. \A...\Z (not ^...$) also
+# rejects a trailing newline.
+#
+# Access key IDs (AKIA/ASIA...) per the STS Credentials.AccessKeyId grammar:
+# length 16-128, pattern [\w] = [A-Za-z0-9_] ("any upper- or lowercase letter
+# or digit"). We match the documented grammar rather than the observed
+# uppercase-only form so a docs-valid key is never wrongly rejected; the \A...\Z
+# anchors still reject newlines and control characters.
+ACCESS_KEY_ID_REGEX_PATTERN = re.compile(r"\A[A-Za-z0-9_]{16,128}\Z")
+# STS session tokens are base64url-ish (base64 alphabet plus padding).
+SESSION_TOKEN_REGEX_PATTERN = re.compile(r"\A[A-Za-z0-9+/=_-]+\Z")
+
+# rolearn and jwtpath must each be a single line with no control characters.
+# \A...\Z (not ^...$) also rejects a trailing newline.
+#
+# rolearn: an IAM role ARN. The partition is left open (aws, aws-cn, aws-us-gov,
+# aws-iso*, ...); the role path/name uses the IAM character set plus "/".
+ROLEARN_REGEX_PATTERN = re.compile(
+    r"\Aarn:aws[a-z0-9-]*:iam::[0-9]{12}:role/[a-zA-Z0-9+=,.@_/-]+\Z"
+)
+# jwtpath: an absolute path, restricted to a config-safe set (no space/comma/"=").
+JWTPATH_REGEX_PATTERN = re.compile(r"\A/[a-zA-Z0-9._/-]+\Z")
+
+# Backstop at the serialization chokepoint: config lines are unescaped "k = v", so
+# no value (from any source) may contain a control character. Rejects C0, DEL,
+# and C1.
+CONFIG_CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 EFS_SERVICE_NAME = "elasticfilesystem"
 S3FILES_SERVICE_NAME = "s3files"

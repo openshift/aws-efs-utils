@@ -19,15 +19,18 @@ import platform
 import pwd
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections import namedtuple
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from signal import SIGHUP, SIGKILL, SIGTERM
+from typing import Optional
 
 try:
     from configparser import ConfigParser, NoOptionError, NoSectionError
@@ -56,7 +59,7 @@ AMAZON_LINUX_2_RELEASE_VERSIONS = [
     AMAZON_LINUX_2_RELEASE_ID,
     AMAZON_LINUX_2_PRETTY_NAME,
 ]
-VERSION = "3.3.2"
+VERSION = "3.3.5"
 SERVICE = "elasticfilesystem"
 FS_PREFIX = "fs-"
 
@@ -153,8 +156,30 @@ REQUEST_PAYLOAD = ""
 
 AP_ID_RE = re.compile("^(?:fsap)-[0-9a-f]{17}$")
 
+# Credential-provider values must match the STS credential grammar exactly: one
+# line, no whitespace or control characters.
+# accessKeyId follows the STS Credentials.AccessKeyId grammar: length 16-128,
+# pattern [\w] = [A-Za-z0-9_]. sessionToken is base64/base64url with no fixed
+# size (STS: "make no assumptions about the maximum size").
+ACCESS_KEY_ID_RE = re.compile(r"\A[A-Za-z0-9_]{16,128}\Z")
+SESSION_TOKEN_RE = re.compile(r"\A[A-Za-z0-9+/=_-]+\Z")
+
 ECS_TASK_METADATA_API = "http://169.254.170.2"
-STS_ENDPOINT_URL_FORMAT = "https://sts.{}.{}/"
+STS_ENDPOINT_URL_FORMAT: str = "https://{host}.{region}.{dns_name_suffix}/"
+# Local copies of efs_utils_common.constants values; the installed watchdog is
+# standalone and cannot import efs_utils_common.
+STS_HOST: str = "sts"
+STS_FIPS_HOST: str = "sts-fips"
+GOVCLOUD_REGION_PREFIX: str = "us-gov-"
+# The annotation is a string: a module-level annotation is evaluated at import time, and
+# tuple[...] is not subscriptable before Python 3.9.
+FIPS_REGION_PREFIXES: "tuple[str, ...]" = (
+    "us-",
+    "ca-",
+)
+AWS_FIPS_ENDPOINT_CONFIG_ENV: str = "AWS_USE_FIPS_ENDPOINT"
+# Written by the mount helper; kept in sync by value.
+USE_FIPS_ENDPOINT_STATE_KEY: str = "useFipsEndpoint"
 INSTANCE_IAM_URL = "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
 INSTANCE_METADATA_TOKEN_URL = "http://169.254.169.254/latest/api/token"
 SECURITY_CREDS_ECS_URI_HELP_URL = (
@@ -187,6 +212,13 @@ PROC_STAT_PATH_FORMAT = "/proc/%s/stat"
 # still listed. Z is the one that occurs: a zombie keeps its name until reaped.
 DEAD_RUN_STATES = (b"Z", b"X", b"x")
 
+# Max time for a spawned child to reach exec.
+SPAWN_TIMEOUT_SEC = 60
+
+SPAWN_KILL_REAP_TIMEOUT_SEC = 5
+
+OPENSSL_TIMEOUT_SEC = 60
+
 # Unmount difference time in seconds
 UNMOUNT_DIFF_TIME = 30
 
@@ -200,6 +232,10 @@ STUNNEL_INSTALLATION_MESSAGE = "Please install it following the instructions at:
 EFS_PROXY_INSTALLATION_MESSAGE = "Please install it by reinstalling amazon-efs-utils"
 
 EFS_PROXY_BIN = "efs-proxy"
+
+# Local copy of efs_utils_common.constants.EFS_PROXY_WORKER_THREADS_OPTION; the
+# installed watchdog is standalone and cannot import efs_utils_common.
+EFS_PROXY_WORKER_THREADS_OPTION = "--worker-threads"
 
 OPTIMIZE_READAHEAD_ITEM = "optimize_readahead"
 DEFAULT_NFS_MAX_READAHEAD_MULTIPLIER = 15
@@ -217,11 +253,19 @@ def fatal_error(user_message, log_message=None):
     sys.exit(1)
 
 
-def get_aws_security_credentials(config, credentials_source, region):
+def get_aws_security_credentials(
+    config: ConfigParser,
+    credentials_source: str,
+    region: str,
+    use_fips_endpoint: Optional[bool] = None,
+) -> "Optional[dict[str, object]]":
     """
     Lookup AWS security credentials (access key ID and secret access key). Adapted credentials provider chain from:
     https://boto3.amazonaws.com/v1/documentation/api/latest/guide/configuration.html and
     https://docs.aws.amazon.com/sdk-for-java/v1/developer-guide/credentials.html
+
+    use_fips_endpoint is the mount's recorded FIPS choice for a webidentity source; see
+    get_sts_endpoint_url.
     """
     method, value = credentials_source.split(":", 1)
 
@@ -236,8 +280,22 @@ def get_aws_security_credentials(config, credentials_source, region):
     elif method == "podidentity":
         return get_aws_security_credentials_from_pod_identity(config, value)
     elif method == "webidentity":
+        role_arn: str
+        token_file: str
+        try:
+            role_arn, token_file = value.split(",")
+        except ValueError:
+            logging.error(
+                'Improper webidentity credentials source "%s" found from mount state file',
+                credentials_source,
+            )
+            return None
         return get_aws_security_credentials_from_webidentity(
-            config, *(value.split(",")), region=region
+            config=config,
+            role_arn=role_arn,
+            token_file=token_file,
+            region=region,
+            use_fips_endpoint=use_fips_endpoint,
         )
     elif method == "metadata":
         return get_aws_security_credentials_from_instance_metadata(config)
@@ -488,7 +546,17 @@ def get_aws_security_credentials_from_pod_identity(config, value):
     return None
 
 
-def get_aws_security_credentials_from_webidentity(config, role_arn, token_file, region):
+def get_aws_security_credentials_from_webidentity(
+    config: ConfigParser,
+    role_arn: str,
+    token_file: str,
+    region: str,
+    use_fips_endpoint: Optional[bool] = None,
+) -> "Optional[dict[str, object]]":
+    """Assume role_arn with the web identity token in token_file through STS.
+
+    use_fips_endpoint is the mount's recorded FIPS choice; see get_sts_endpoint_url.
+    """
     try:
         with open(token_file, "r") as f:
             token = f.read()
@@ -496,7 +564,11 @@ def get_aws_security_credentials_from_webidentity(config, role_arn, token_file, 
         logging.error("Error reading token file %s: %s", token_file, e)
         return None
 
-    sts_endpoint_url = get_sts_endpoint_url(config, region)
+    sts_endpoint_url = get_sts_endpoint_url(
+        config=config,
+        region=region,
+        use_fips_endpoint=use_fips_endpoint,
+    )
     webidentity_url = (
         sts_endpoint_url
         + "?"
@@ -543,7 +615,18 @@ def get_aws_security_credentials_from_webidentity(config, role_arn, token_file, 
     return None
 
 
-def get_sts_endpoint_url(config, region):
+def get_sts_endpoint_url(
+    config: ConfigParser,
+    region: str,
+    use_fips_endpoint: Optional[bool] = None,
+) -> str:
+    """Return the regional STS endpoint URL that AssumeRoleWithWebIdentity calls.
+
+    The host follows the rules documented on
+    efs_utils_common.aws_credentials.get_sts_endpoint_url. use_fips_endpoint is the
+    mount's FIPS choice, read from its state file; None means the state file records no
+    choice, and get_fips_config decides.
+    """
     # The dns_name_suffix from config may be an S3 Files "on.*" domain that
     # doesn't match the STS endpoint domain. Map to the correct STS domain.
     dns_name_suffix = get_dns_name_suffix(config, region)
@@ -551,7 +634,47 @@ def get_sts_endpoint_url(config, region):
         dns_name_suffix = "amazonaws.com"
     elif dns_name_suffix == "on.amazonwebservices.com.cn":
         dns_name_suffix = "amazonaws.com.cn"
-    return STS_ENDPOINT_URL_FORMAT.format(region, dns_name_suffix)
+    use_fips: bool = (
+        get_fips_config(config) if use_fips_endpoint is None else use_fips_endpoint
+    )
+    host: str = (
+        STS_FIPS_HOST
+        if use_fips
+        and has_fips_endpoints(region)
+        and not region.startswith(GOVCLOUD_REGION_PREFIX)
+        else STS_HOST
+    )
+    return STS_ENDPOINT_URL_FORMAT.format(
+        host=host,
+        region=region,
+        dns_name_suffix=dns_name_suffix,
+    )
+
+
+def has_fips_endpoints(region: str) -> bool:
+    """Return whether region has FIPS endpoints.
+
+    Local copy of efs_utils_common.metadata.has_fips_endpoints; the installed watchdog is
+    standalone and cannot import efs_utils_common.
+    """
+    return region.startswith(FIPS_REGION_PREFIXES)
+
+
+def get_fips_config(config: ConfigParser) -> bool:
+    """Return whether FIPS is on: AWS_USE_FIPS_ENDPOINT=true, or [mount] fips_mode_enabled.
+
+    Local copy of efs_utils_common.metadata.get_fips_config; the installed watchdog is
+    standalone and cannot import efs_utils_common.
+    """
+    return os.getenv(
+        key=AWS_FIPS_ENDPOINT_CONFIG_ENV,
+        default="False",
+    ).lower() == "true" or get_boolean_config_item_value(
+        config=config,
+        config_section=MOUNT_CONFIG_SECTION,
+        config_item="fips_mode_enabled",
+        default_value=False,
+    )
 
 
 def get_dns_name_suffix(config, region):
@@ -948,6 +1071,198 @@ def get_state_files(state_file_dir):
     return state_files
 
 
+def get_orphaned_temp_state_files(state_file_dir):
+    """Return "~fs-" temp state files, which get_state_files does not see."""
+    temp_prefix = "~" + FS_PREFIX
+    orphans = []
+
+    if os.path.isdir(state_file_dir):
+        for sf in os.listdir(state_file_dir):
+            path = os.path.join(state_file_dir, sf)
+            if sf.startswith(temp_prefix) and not os.path.isdir(path):
+                orphans.append(path)
+
+    return orphans
+
+
+# Fallback for temp state files that do not record their writer (written by an
+# older mount helper): one past this age is assumed abandoned.
+ORPHANED_TEMP_STATE_FILE_GRACE_SEC = 300
+
+
+def _remove_orphaned_path(path):
+    try:
+        os.remove(path)
+    except OSError as e:
+        if e.errno != errno.ENOENT:
+            logging.debug("Failed to remove orphaned path %s: %s", path, e)
+
+
+def remove_stale_scratch_files(state_file_dir, grace_period_sec, now):
+    """Remove "~*.tmp" scratch files left by a mount helper killed mid-write.
+
+    A scratch file is live for one json.dump, so one past the grace period
+    is garbage. No scan matches the name, so nothing else would remove it.
+    """
+    if not os.path.isdir(state_file_dir):
+        return
+    for sf in os.listdir(state_file_dir):
+        path = os.path.join(state_file_dir, sf)
+        if not (sf.startswith("~") and sf.endswith(".tmp")) or os.path.isdir(path):
+            continue
+        try:
+            if now - os.path.getmtime(path) < grace_period_sec:
+                continue
+        except OSError:
+            continue
+        logging.info("Removing stale scratch file %s", path)
+        _remove_orphaned_path(path)
+
+
+def get_process_start_time(pid):
+    """Return the start time of pid, or None if it is not running.
+
+    Linux: field 22 of /proc/<pid>/stat, clock ticks since boot. macOS: the
+    fixed-format `ps -o lstart` string. Only compared for equality.
+    """
+    if check_if_running_on_macos():
+        return _get_process_start_time_macos(pid)
+    try:
+        with open(PROC_STAT_PATH_FORMAT % pid, "rb") as f:
+            stat_line = f.read()
+    except OSError:
+        return None
+    # The name in field 2 may contain spaces or parentheses; it ends at the last ")".
+    fields_after_name = stat_line[stat_line.rfind(b")") + 1 :].split()
+    try:
+        return int(fields_after_name[19])
+    except (IndexError, ValueError):
+        return None
+
+
+# Local copy of efs_utils_common.proxy.PS_LSTART_ENV: `ps -o lstart` is formatted
+# with the caller's locale and time zone, so both sides pin them.
+PS_LSTART_ENV = {"LC_ALL": "C", "TZ": "UTC", "PATH": "/bin:/usr/bin"}
+
+
+def _get_process_start_time_macos(pid):
+    p = subprocess.Popen(
+        ["ps", "-p", str(pid), "-o", "lstart="],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        close_fds=True,
+        env=PS_LSTART_ENV,
+    )
+    try:
+        out = p.communicate(timeout=PROCESS_NAME_TIMEOUT_SEC)[0]
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.communicate()
+        return None
+    return out.decode().strip() or None
+
+
+def is_recorded_proxy_pid_stale(state):
+    """True if the state's pid now belongs to another process (or none)."""
+    start_time = state.get("pid_start_time")
+    if not state.get("pid") or start_time is None:
+        return False
+    return get_process_start_time(state["pid"]) != start_time
+
+
+def is_state_file_writer_alive(state):
+    """True/False if the mount helper that wrote this state is alive; None if unknown."""
+    pid = state.get("writer_pid")
+    start_time = state.get("writer_start_time")
+    if not pid or start_time is None:
+        return None
+    # pid and start time together identify the process; a reused pid has a new start time.
+    return get_process_start_time(pid) == start_time
+
+
+def reconcile_orphaned_temp_state_files(
+    state_file_dir=STATE_FILE_DIR,
+    grace_period_sec=ORPHANED_TEMP_STATE_FILE_GRACE_SEC,
+):
+    """Finalize temp state files whose mount helper died before renaming them.
+
+    Once finalized, check_efs_mounts restarts efs-proxy if the mount is live or
+    cleans up if it is not. Temps that cannot be finalized are removed, as are
+    stale "~*.tmp" scratch files.
+    """
+    now = time.time()
+    remove_stale_scratch_files(state_file_dir, grace_period_sec, now)
+    for temp_path in get_orphaned_temp_state_files(state_file_dir):
+        try:
+            past_grace = now - os.path.getmtime(temp_path) >= grace_period_sec
+        except OSError as e:
+            logging.debug(
+                "Could not stat orphaned temp state file %s: %s", temp_path, e
+            )
+            continue
+
+        final_name = os.path.basename(temp_path)[1:]
+        final_path = os.path.join(state_file_dir, final_name)
+        if os.path.exists(final_path):
+            if past_grace:
+                logging.info(
+                    "Removing stale temp state file %s; finalized state file %s exists",
+                    temp_path,
+                    final_name,
+                )
+                _remove_orphaned_path(temp_path)
+            continue
+
+        state = {}
+        try:
+            with open(temp_path) as f:
+                state = json.load(f)
+        except (ValueError, OSError) as e:
+            logging.debug(
+                "Could not parse orphaned temp state file %s: %s", temp_path, e
+            )
+        # start_tls_tunnel needs "cmd"; a temp without it is a torn write.
+        if not state.get("cmd"):
+            if past_grace:
+                logging.warning(
+                    "Removing unreadable orphaned temp state file %s for mountpoint %s",
+                    temp_path,
+                    state.get("mountpoint"),
+                )
+                _remove_orphaned_path(temp_path)
+            continue
+
+        writer_alive = is_state_file_writer_alive(state)
+        if writer_alive or (writer_alive is None and not past_grace):
+            logging.debug(
+                "Temp state file %s may be a mount in progress, skipping", temp_path
+            )
+            continue
+
+        logging.warning(
+            "Finalizing orphaned temp state file %s for mountpoint %s",
+            temp_path,
+            state.get("mountpoint"),
+        )
+        try:
+            os.rename(temp_path, final_path)
+        except OSError as e:
+            # The writer may have renamed it first.
+            if e.errno != errno.ENOENT:
+                logging.debug(
+                    "Failed to finalize orphaned temp state file %s: %s", temp_path, e
+                )
+            continue
+        # clean_up_previous_tunnel_pids only runs at startup, so a pid that has
+        # since been reused would otherwise pass as this mount's proxy.
+        if is_recorded_proxy_pid_stale(state):
+            logging.info(
+                "Dropping stale proxy pid %s from %s", state.pop("pid"), final_name
+            )
+            state.pop("pid_start_time", None)
+            rewrite_state_file(state, state_file_dir, final_name)
+
+
 def get_pid_in_state_dir(state_file, state_file_dir):
     """
     :param state_file: The state file path, e.g. fs-deadbeef.mnt.20560.
@@ -1187,11 +1502,11 @@ def start_tls_tunnel(child_procs, state, state_file_dir, state_file):
     )
     tunnel = None
     try:
-        tunnel = subprocess.Popen(
+        tunnel = popen_with_spawn_deadline(
             command,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            preexec_fn=os.setsid,
+            start_new_session=True,
             close_fds=True,
         )
     except FileNotFoundError as e:
@@ -1213,11 +1528,11 @@ def start_tls_tunnel(child_procs, state, state_file_dir, state_file):
                         )
                         break
 
-                tunnel = subprocess.Popen(
+                tunnel = popen_with_spawn_deadline(
                     command,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    preexec_fn=os.setsid,
+                    start_new_session=True,
                     close_fds=True,
                 )
 
@@ -1236,6 +1551,7 @@ def start_tls_tunnel(child_procs, state, state_file_dir, state_file):
         tunnel_process_name = "efs-proxy"
 
     if tunnel is None or not is_pid_running(tunnel.pid):
+        log_worker_threads_restart_hint(command)
         fatal_error(
             "Failed to initialize %s for %s" % (tunnel_process_name, state_file),
             "Failed to start %s." % tunnel_process_name,
@@ -1327,7 +1643,14 @@ def restart_tls_tunnel(child_procs, state, state_file_dir, state_file):
         )
         return
 
-    new_tunnel_pid = start_tls_tunnel(child_procs, state, state_file_dir, state_file)
+    try:
+        new_tunnel_pid = start_tls_tunnel(
+            child_procs, state, state_file_dir, state_file
+        )
+    except SpawnTimeoutError:
+        # Retry on the next poll instead of exiting the watchdog for every mount.
+        logging.warning("TLS tunnel for %s did not start, will retry", state_file)
+        return
     state["pid"] = new_tunnel_pid
 
     logging.debug("Rewriting %s with new pid: %d", state_file, new_tunnel_pid)
@@ -1440,7 +1763,7 @@ def verify_and_update_readahead(mount, config, mount_info):
 
         # Use subprocess with timeout to get device number to avoid hanging on os.stat()
         # when NFS mount is stuck (e.g., security group blocks traffic)
-        process = subprocess.Popen(
+        process = popen_with_spawn_deadline(
             ["stat", "-c", "%d", mount],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1463,7 +1786,7 @@ def verify_and_update_readahead(mount, config, mount_info):
         read_ahead_kb_config_file = NFS_READAHEAD_CONFIG_PATH_FORMAT % (major, minor)
 
         # Use subprocess with timeout to read sysfs to avoid hanging when kernel is stuck
-        process = subprocess.Popen(
+        process = popen_with_spawn_deadline(
             ["cat", read_ahead_kb_config_file],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1496,19 +1819,28 @@ def verify_and_update_readahead(mount, config, mount_info):
                 expected_readahead_kb,
                 current_readahead_kb,
             )
-            p = subprocess.Popen(
+            p = popen_with_spawn_deadline(
                 "echo %s > %s" % (expected_readahead_kb, read_ahead_kb_config_file),
                 shell=True,
                 stderr=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
             )
-            _, error = p.communicate()
+            try:
+                _, error = p.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                logging.warning("Timeout writing readahead for %s, skipping", mount)
+                return
             if p.returncode != 0:
                 logging.warning(
                     'Failed to modify read_ahead_kb: %s with returncode: %d, error: "%s".'
                     % (expected_readahead_kb, p.returncode, error.strip())
                 )
 
+    except SpawnTimeoutError:
+        logging.warning(
+            "Readahead check for %s skipped: a command did not start", mount
+        )
     except Exception as e:
         logging.warning("Failed to verify/update readahead for %s: %s", mount, str(e))
 
@@ -1585,12 +1917,18 @@ def check_stunnel_health(
         rewrite_state_file(state, state_file_dir, state_file)
 
     stunnel_pid = state["pid"]
-    process = subprocess.Popen(
-        ["df", mountpoint],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-    )
+    try:
+        process = popen_with_spawn_deadline(
+            ["df", mountpoint],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except SpawnTimeoutError:
+        logging.warning("Stunnel health check for %s did not start", mountpoint)
+        state["last_stunnel_check_time"] = current_time
+        rewrite_state_file(state, state_file_dir, state_file)
+        return
 
     command_timeout_sec = get_int_value_from_config_file(
         config,
@@ -1671,6 +2009,39 @@ def get_int_value_from_config_file(config, config_name, default_config_value):
         )
 
     return val
+
+
+def log_worker_threads_restart_hint(command):
+    """Explain a pinned-worker-count proxy that dies the moment it is restarted.
+
+    efs-proxy refuses a --worker-threads value above the parallelism available to
+    its own process. The watchdog's cgroup need not match the one the mount was
+    issued from -- a CPUQuota on amazon-efs-mount-watchdog.service, or a live
+    `systemctl set-property`, is enough for them to differ -- so a count accepted
+    at mount time can be refused on restart. The proxy writes the reason to
+    stderr, which this path sends to DEVNULL, so without this the only trace is
+    "Failed to start efs-proxy".
+
+    Deliberately does not print an available-parallelism number: computing it
+    here would mean reading only the affinity mask, which ignores any cgroup CPU
+    quota and so can disagree with the figure efs-proxy actually used.
+    """
+    try:
+        requested = command[command.index(EFS_PROXY_WORKER_THREADS_OPTION) + 1]
+    except (ValueError, IndexError):
+        # No pinned count in this command, so this is not the failure mode.
+        return
+
+    logging.warning(
+        "efs-proxy exited immediately and its command pins %s %s. efs-proxy "
+        "refuses a worker count above the parallelism available to its own "
+        "process; on restart that is this watchdog service's cgroup, which need "
+        "not match the cgroup the mount was issued from. If they differ, lower "
+        "or remove efs_proxy_worker_threads in the mount section of "
+        "efs-utils.conf and remount.",
+        EFS_PROXY_WORKER_THREADS_OPTION,
+        requested,
+    )
 
 
 def check_child_procs(child_procs):
@@ -1811,15 +2182,16 @@ def check_certificate(
     credentials_source = state.get("awsCredentialsMethod")
     updated_certificate_creation_time, updated_credentials_expiration = (
         recreate_certificate(
-            config,
-            state["mountStateDir"],
-            state["commonName"],
-            state["fsId"],
-            credentials_source,
-            ap_state,
-            state["region"],
-            service,
+            config=config,
+            mount_name=state["mountStateDir"],
+            common_name=state["commonName"],
+            fs_id=state["fsId"],
+            credentials_source=credentials_source,
+            ap_id=ap_state,
+            region=state["region"],
+            service=service,
             base_path=base_path,
+            use_fips_endpoint=state.get(USE_FIPS_ENDPOINT_STATE_KEY),
         )
     )
     if updated_certificate_creation_time:
@@ -1925,7 +2297,12 @@ def recreate_certificate(
     region,
     service,
     base_path=STATE_FILE_DIR,
+    use_fips_endpoint: Optional[bool] = None,
 ):
+    """Recreate the mount's self-signed certificate.
+
+    use_fips_endpoint is the mount's recorded FIPS choice; see get_sts_endpoint_url.
+    """
     current_time = get_utc_now()
     tls_paths = tls_paths_dictionary(mount_name, base_path)
 
@@ -1949,18 +2326,19 @@ def recreate_certificate(
 
     client_info = get_client_info(config)
     config_body, credentials_expiration = create_ca_conf(
-        config,
-        certificate_config,
-        common_name,
-        tls_paths["mount_dir"],
-        private_key,
-        current_time,
-        region,
-        fs_id,
-        credentials_source,
-        service,
+        config=config,
+        config_path=certificate_config,
+        common_name=common_name,
+        directory=tls_paths["mount_dir"],
+        private_key=private_key,
+        date=current_time,
+        region=region,
+        fs_id=fs_id,
+        credentials_source=credentials_source,
+        service=service,
         ap_id=ap_id,
         client_info=client_info,
+        use_fips_endpoint=use_fips_endpoint,
     )
 
     if not config_body:
@@ -2078,6 +2456,7 @@ def create_ca_conf(
     service,
     ap_id=None,
     client_info=None,
+    use_fips_endpoint: Optional[bool] = None,
 ):
     """Populate ca/req configuration file with fresh configurations at every mount since SigV4 signature can change
 
@@ -2085,10 +2464,17 @@ def create_ca_conf(
     credential's "Expiration" as a valid ISO-8601 string when the source provides a usable one,
     else None (absent, or present but unparseable). It lets the caller schedule the next refresh
     before the embedded credential expires. On failure returns (None, None).
+
+    use_fips_endpoint is the mount's recorded FIPS choice; see get_sts_endpoint_url.
     """
     public_key_path = os.path.join(directory, "publicKey.pem")
     security_credentials = (
-        get_aws_security_credentials(config, credentials_source, region)
+        get_aws_security_credentials(
+            config=config,
+            credentials_source=credentials_source,
+            region=region,
+            use_fips_endpoint=use_fips_endpoint,
+        )
         if credentials_source
         else ""
     )
@@ -2207,6 +2593,17 @@ def efs_client_auth_builder(
     signature = calculate_signature(
         string_to_sign, date, secret_access_key, region, service
     )
+
+    # Reject a malformed credential before use. In the long-lived watchdog, skip
+    # just this refresh (return None; the caller logs and moves on) rather than
+    # fatal_error, which would stop cert refresh for every mount on the host.
+    if not ACCESS_KEY_ID_RE.match(access_key_id):
+        logging.error("accessKeyId is malformed; skipping SigV4 signature section")
+        return None
+    if session_token and not SESSION_TOKEN_RE.match(session_token):
+        logging.error("sessionToken is malformed; skipping SigV4 signature section")
+        return None
+
     efs_client_auth_str = "[ efs_client_auth ]"
     efs_client_auth_str += "\naccessKeyId = UTF8String:" + access_key_id
     efs_client_auth_str += "\nsignature = OCTETSTRING:" + signature
@@ -2232,12 +2629,133 @@ def create_public_key(private_key, public_key):
     subprocess_call(cmd, "Failed to create public key")
 
 
+class SpawnTimeoutError(OSError):
+    """A child process did not reach exec() within the spawn deadline."""
+
+    def __init__(self, message, process=None):
+        super().__init__(message)
+        self.process = process
+
+
+_EXECUTE_CHILD_CODE = subprocess.Popen._execute_child.__code__
+
+
+def _raise_spawn_timeout(signum, frame):
+    # Only fire while Popen is waiting for the child to exec.
+    while frame is not None:
+        if frame.f_code is _EXECUTE_CHILD_CODE:
+            raise SpawnTimeoutError(
+                "child process did not exec within the spawn deadline",
+                process=frame.f_locals.get("self"),
+            )
+        frame = frame.f_back
+
+
+def _prefer_posix_spawn(args, kwargs):
+    """Rewrite Popen() arguments so subprocess uses posix_spawn() when it can.
+
+    A posix_spawn() child shares the parent's memory and runs no fork handlers or
+    LD_PRELOAD exec wrappers, so it cannot get stuck on an inherited lock. subprocess
+    needs an absolute executable and close_fds=False for that path; Python opens
+    file descriptors non-inheritable, so closing them is not needed.
+    """
+    if not getattr(subprocess, "_USE_POSIX_SPAWN", False) or any(
+        kwargs.get(option)
+        for option in ("preexec_fn", "start_new_session", "cwd", "pass_fds")
+    ):
+        return args, kwargs
+
+    if not kwargs.get("shell") and args and not os.path.dirname(args[0]):
+        resolved = shutil.which(args[0])
+        if not resolved:
+            return args, kwargs
+        args = [resolved] + list(args[1:])
+    return args, dict(kwargs, close_fds=False)
+
+
+def popen_with_spawn_deadline(args, spawn_timeout_sec=SPAWN_TIMEOUT_SEC, **kwargs):
+    """Popen() that raises SpawnTimeoutError if the child does not exec in time.
+
+    Popen() blocks until the child execs, so a child stuck after fork (e.g. on a
+    lock inherited from an LD_PRELOAD library's thread) would hang the poll loop.
+    Uses SIGALRM, so it only applies on the main thread with no other timer armed.
+    """
+    args, kwargs = _prefer_posix_spawn(args, kwargs)
+
+    if (
+        threading.current_thread() is not threading.main_thread()
+        or signal.getitimer(signal.ITIMER_REAL)[0] > 0
+    ):
+        return subprocess.Popen(args, **kwargs)
+
+    previous_handler = signal.signal(signal.SIGALRM, _raise_spawn_timeout)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, spawn_timeout_sec)
+        try:
+            return subprocess.Popen(args, **kwargs)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    except SpawnTimeoutError as e:
+        _kill_unexeced_child(e.process, args, spawn_timeout_sec)
+        raise
+    finally:
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def _kill_unexeced_child(process, args, spawn_timeout_sec):
+    pid = getattr(process, "pid", None)
+    if not pid:
+        logging.error(
+            "Child process for %s did not exec within %s sec and could not be identified",
+            args,
+            spawn_timeout_sec,
+        )
+        return
+
+    logging.error(
+        "Child process %s for %s did not exec within %s sec, killing it",
+        pid,
+        args,
+        spawn_timeout_sec,
+    )
+    try:
+        os.kill(pid, SIGKILL)
+    except OSError as e:
+        logging.warning("Failed to kill child process %s: %s", pid, e)
+        return
+
+    deadline = time.monotonic() + SPAWN_KILL_REAP_TIMEOUT_SEC
+    while True:
+        try:
+            reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if reaped_pid == pid:
+            process.returncode = -SIGKILL
+            return
+        if time.monotonic() >= deadline:
+            # Popen.__del__ or a later Popen() reaps it once it exits.
+            logging.warning("Killed child process %s has not exited yet", pid)
+            return
+        time.sleep(0.05)
+
+
 def subprocess_call(cmd, error_message):
     """Helper method to run shell openssl command and to handle response error messages"""
-    process = subprocess.Popen(
-        cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True
-    )
-    output, err = process.communicate()
+    try:
+        process = popen_with_spawn_deadline(
+            cmd.split(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True
+        )
+    except SpawnTimeoutError:
+        logging.error("%s. Command %s did not start", error_message, cmd)
+        return None
+    try:
+        output, err = process.communicate(timeout=OPENSSL_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        logging.error("%s. Command %s timed out", error_message, cmd)
+        process.kill()
+        process.communicate()
+        return None
     rc = process.poll()
     if rc != 0:
         logging.debug(
@@ -2314,9 +2832,12 @@ def get_public_key_sha1(public_key):
     #    17:d=2  hl=2 l=   0 prim: NULL
     #    19:d=1  hl=4 l= 399 prim: BIT STRING
     cmd = "openssl asn1parse -inform PEM -in %s" % public_key
-    output, err = subprocess_call(
+    result = subprocess_call(
         cmd, "Unable to ASN1 parse public key file, %s, correctly" % public_key
     )
+    if result is None:
+        return None
+    output, err = result
 
     key_line = ""
     for line in output.splitlines():
@@ -2600,6 +3121,8 @@ def clean_up_previous_tunnel_pids(state_file_dir=STATE_FILE_DIR):
     pod after driver restart, upgrade, or crash. This method attempts to clean PIDs from persisted
     state files after efs-csi-driver restart to ensure watchdog creates a new tunnel.
     """
+    reconcile_orphaned_temp_state_files(state_file_dir)
+
     state_files = get_state_files(state_file_dir)
     logging.debug(
         'Persisted state files in "%s": %s', state_file_dir, list(state_files.values())
@@ -2675,6 +3198,7 @@ def main():
         while True:
             config = read_config()
 
+            reconcile_orphaned_temp_state_files()
             check_efs_mounts(
                 config,
                 child_procs,
