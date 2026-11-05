@@ -8,9 +8,14 @@
 set -euxo pipefail
 
 yum update -y
-yum install --setopt=tsflags=nodocs -y nfs-utils stunnel python3 openssl util-linux which make python3-pip python3-jmespath python3-urllib3 python3-six.noarch python3-wheel python3-dateutil
+yum install --setopt=tsflags=nodocs -y nfs-utils stunnel openssl util-linux which make python3.12 python3.12-pip python3.12-setuptools python3.12-wheel
 yum clean all
 rm -rf /var/cache/yum/*
+
+# Configure python3 to use python3.12 since RHEL 9 defaults to python3.9
+ln -sf /usr/bin/python3.12 /usr/bin/python3
+ln -sf /usr/bin/pip3.12 /usr/bin/pip3
+ln -sf /usr/bin/pip3.12 /usr/bin/pip
 
 REQS=/src/requirements.txt.ocp
 
