@@ -29,6 +29,3 @@ fi
 # Finally, install all remaining requirements, ideally just botocore.
 # --no-build-isolation: use system setuptools and /bin/wheel from RPM packages.
 python3 -m pip install -r "${REQS}" --no-build-isolation
-
-# Apply the pinned downstream bundle adjustment after either installation path.
-python3 /src/update-botocore-bundle-ocp.py
