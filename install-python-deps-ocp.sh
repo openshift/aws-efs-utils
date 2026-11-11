@@ -8,7 +8,8 @@
 set -euxo pipefail
 
 yum update -y
-yum install --setopt=tsflags=nodocs -y nfs-utils stunnel python3 openssl util-linux which make python3-pip python3-jmespath python3-urllib3 python3-six.noarch python3-wheel python3-dateutil
+yum install --setopt=tsflags=nodocs -y nfs-utils stunnel python3.11 openssl util-linux which make python3.11-pip python3.11-setuptools python3.11-wheel python3.11-urllib3 python3.11-pyyaml python3.11-six.noarch python3.11-packaging
+alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 yum clean all
 rm -rf /var/cache/yum/*
 
@@ -25,6 +26,9 @@ if [[ -v REMOTE_SOURCES ]]; then
         REQS="${REMOTE_SOURCES_DIR}/cachito-gomod-with-deps/app/requirements.txt.ocp"
     fi
 fi
+
+# Install setuptools-scm first so python-dateutil can resolve its version when built from sdist with --no-build-isolation.
+python3 -m pip install setuptools-scm==8.1.0 --no-build-isolation
 
 # Finally, install all remaining requirements, ideally just botocore.
 # --no-build-isolation: use system setuptools and /bin/wheel from RPM packages.
