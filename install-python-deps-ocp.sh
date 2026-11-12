@@ -7,8 +7,21 @@
 
 set -euxo pipefail
 
-yum update -y
-yum install --setopt=tsflags=nodocs -y nfs-utils stunnel python3.11 openssl util-linux which make python3.11-pip python3.11-setuptools python3.11-wheel python3.11-urllib3 python3.11-pyyaml python3.11-six.noarch python3.11-packaging
+for attempt in {1..5}; do
+    yum update --setopt=keepcache=1 -y && break
+    if [[ "${attempt}" -eq 5 ]]; then
+        exit 1
+    fi
+    sleep 5
+done
+
+for attempt in {1..5}; do
+    yum install --setopt=tsflags=nodocs --setopt=keepcache=1 -y nfs-utils stunnel python3.11 openssl util-linux which make python3.11-pip python3.11-setuptools python3.11-wheel python3.11-urllib3 python3.11-pyyaml python3.11-six.noarch python3.11-packaging && break
+    if [[ "${attempt}" -eq 5 ]]; then
+        exit 1
+    fi
+    sleep 5
+done
 alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
 yum clean all
 rm -rf /var/cache/yum/*
